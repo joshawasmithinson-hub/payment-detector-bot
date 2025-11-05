@@ -30,7 +30,6 @@ if not email_configs:
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Persistent UID tracking
 SEEN_FILE = "seen_uids.json"
 
 def load_seen_uids():
@@ -46,7 +45,6 @@ def save_seen_uids():
 
 seen_uids = load_seen_uids()
 
-# Payment patterns
 PATTERNS = {
     'Zelle': [r'You received \$?([\d,]+\.?\d*) from', r'Zelle.+?\$?([\d,]+\.?\d*)'],
     'Chime': [r'You just got paid \$?([\d,]+\.?\d*)', r'Chime.+?\$?([\d,]+\.?\d*)'],
@@ -54,7 +52,8 @@ PATTERNS = {
         r'You received a payment of \$?([\d,]+\.?\d*)',
         r'You received \$?([\d,]+\.?\d*)',
         r'Payment received[:\s]+\$?([\d,]+\.?\d*)',
-        r"You've got money.+?\$?([\d,]+\.?\d*)"
+        r"You've got money.+?\$?([\d,]+\.?\d*)",
+        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)?) sent you \$?([\d,]+\.?\d*) USD'
     ],
     'Cash App': [r'Cash App.+?\$?([\d,]+\.?\d*)'],
     'Venmo': [r'paid you \$?([\d,]+\.?\d*)'],
@@ -80,12 +79,18 @@ def extract_amount_and_sender(text, service):
         match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
         if not match:
             continue
-        amount_str = re.sub(r'[^\d.]', '', match.group(1).strip())
+
+        if service == 'PayPal' and len(match.groups()) == 2:
+            sender = match.group(1).strip()
+            amount_str = re.sub(r'[^\d.]', '', match.group(2).strip())
+        else:
+            amount_str = re.sub(r'[^\d.]', '', match.group(1).strip())
+            sender = extract_sender_info(text)
+
         try:
             amount = float(amount_str)
             if amount <= 0:
                 continue
-            sender = extract_sender_info(text)
             return amount, sender
         except ValueError:
             continue
@@ -214,12 +219,3 @@ def email_check_loop():
         time.sleep(30)
 
 @bot.event
-async def on_ready():
-    print(f'{bot.user} online! History saved to seen_uids.json')
-    thread = threading.Thread(target=email_check_loop, daemon=True)
-    thread.start()
-
-import atexit
-atexit.register(save_seen_uids)
-
-bot.run(TOKEN)
