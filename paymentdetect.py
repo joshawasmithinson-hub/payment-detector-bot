@@ -1,25 +1,15 @@
-# paymentdetect.py
-import os
-import re
-import imaplib
-import email
+import os, re, imaplib, email, asyncio, discord, threading, time, json
 from email.header import decode_header
 from datetime import datetime, timedelta
-import asyncio
-import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
-import threading
-import time
-import json
 
-# ———— READS info.env ————
+# ———— Load Environment Variables ————
 load_dotenv("info.env")
-
 TOKEN = os.getenv('DISCORD_TOKEN')
 
-# Load all accounts
+# ———— Load Email Configs ————
 email_configs = []
 i = 1
 while True:
@@ -40,7 +30,7 @@ if not email_configs:
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# --------------------- PERSISTENT SEEN UIDS ---------------------
+# ———— Persistent Seen UIDs ————
 SEEN_FILE = "seen_uids.json"
 
 def load_seen_uids():
@@ -56,57 +46,43 @@ def save_seen_uids():
 
 seen_uids = load_seen_uids()
 
-# --------------------- PAYMENT PATTERNS ---------------------
+# ———— Payment Patterns ————
 PATTERNS = {
     'Zelle': [r'You received \$?([\d,]+\.?\d*) from', r'Zelle.+?\$?([\d,]+\.?\d*)'],
     'Chime': [r'You just got paid \$?([\d,]+\.?\d*)', r'Chime.+?\$?([\d,]+\.?\d*)'],
- 'PayPal': [r'You received a payment of \$?([\d,]+\.?\d*)'],
+    'PayPal': [
+        r'You received a payment of \$?([\d,]+\.?\d*)',
+        r'You received \$?([\d,]+\.?\d*)',
+        r'Payment received[:\s]+\$?([\d,]+\.?\d*)',
+        r"You've got money.+?\$?([\d,]+\.?\d*)"
+    ],
     'Cash App': [r'Cash App.+?\$?([\d,]+\.?\d*)'],
     'Venmo': [r'paid you \$?([\d,]+\.?\d*)'],
 }
 
-# --------------------- EXTRACT NAME, PHONE, EMAIL ---------------------
+# ———— Extract Sender Info ————
 def extract_sender_info(text):
     name_match = re.search(r'(?:from|sent by|paid by)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)', text, re.IGNORECASE)
-    if name_match:
-        name = name_match.group(1).strip()
-    else:
-        name = None
+    name = name_match.group(1).strip() if name_match else None
 
     phone_match = re.search(r'(\+?\d{1,3}[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})', text)
-    if phone_match:
-        phone = re.sub(r'[^\d+]', '', phone_match.group(1))
+    phone = re.sub(r'[^\d+]', '', phone_match.group(1)) if phone_match else None
+    if phone:
         phone = phone[-10:]
-        phone = '+' + phone if not phone.startswith('+') else phone
-        if not phone.startswith('+1'):
-            phone = '+1' + phone
-    else:
-        phone = None
+        phone = '+1' + phone if not phone.startswith('+') else phone
 
     email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
     sender_email = email_match.group(0).lower() if email_match else None
 
-    if name and phone:
-        return f"{name} ({phone})"
-    elif name:
-        return name
-    elif phone:
-        return phone
-    elif sender_email:
-        return sender_email
-    else:
-        return "Unknown Sender"
+    return name or phone or sender_email or "Unknown Sender"
 
-# --------------------- SAFE AMOUNT + SENDER ---------------------
+# ———— Extract Amount and Sender ————
 def extract_amount_and_sender(text, service):
     for pattern in PATTERNS.get(service, []):
         match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
         if not match:
             continue
-        amount_str = match.group(1).strip()
-        amount_str = re.sub(r'[^\d.]', '', amount_str)
-        if not amount_str or amount_str == '.':
-            continue
+        amount_str = re.sub(r'[^\d.]', '', match.group(1).strip())
         try:
             amount = float(amount_str)
             if amount <= 0:
@@ -117,7 +93,7 @@ def extract_amount_and_sender(text, service):
             continue
     return None, None
 
-# --------------------- EMAIL PARSING ---------------------
+# ———— Parse Email ————
 def parse_email(msg):
     subject = decode_header(msg.get("Subject", ""))[0][0]
     if isinstance(subject, bytes):
@@ -140,12 +116,17 @@ def parse_email(msg):
     full_text = f"{subject}\n{body}"
     from_hdr = email.utils.parseaddr(msg.get("From", ""))[1].lower()
 
+    # DEBUG LOGGING
+    # print("[DEBUG] From:", from_hdr)
+    # print("[DEBUG] Subject:", subject)
+    # print("[DEBUG] Body:", full_text[:500])
+
     service = None
     if 'zelle' in from_hdr or 'zelle' in full_text.lower():
         service = 'Zelle'
     elif 'chime' in from_hdr or 'chime' in full_text.lower():
         service = 'Chime'
-    elif 'paypal' in from_hdr or 'service@paypal.com' in from_hdr:
+    elif 'paypal' in from_hdr or 'paypal' in full_text.lower():
         service = 'PayPal'
     elif 'cash' in from_hdr or 'cashapp' in from_hdr:
         service = 'Cash App'
@@ -166,7 +147,7 @@ def parse_email(msg):
         'subject': subject
     }
 
-# --------------------- CHECK ONE EMAIL (LAST 1 HOUR) ---------------------
+# ———— Check One Email Account ————
 def check_single_email_blocking(cfg):
     try:
         print(f"[DEBUG] Logging into {cfg['address']}...")
@@ -175,8 +156,7 @@ def check_single_email_blocking(cfg):
         mail.select('inbox')
 
         since_date = (datetime.now() - timedelta(hours=1)).strftime('%d-%b-%Y')
-        search_query = f'(SINCE "{since_date}")'
-        status, data = mail.search(None, search_query)
+        status, data = mail.search(None, f'(SINCE "{since_date}")')
         if status != 'OK':
             print(f"[DEBUG] Search failed")
             mail.close()
@@ -191,7 +171,6 @@ def check_single_email_blocking(cfg):
             return
 
         print(f"[DEBUG] Found {len(uids)} email(s)")
-
         channel = bot.get_channel(cfg['channel_id'])
         if not channel:
             print(f"[ERROR] Channel not found!")
@@ -228,7 +207,7 @@ def check_single_email_blocking(cfg):
                 asyncio.run_coroutine_threadsafe(channel.send(embed=embed), bot.loop)
 
             seen_uids[cfg['address']].add(uid)
-            save_seen_uids()  # Save after each new email
+            save_seen_uids()
 
         mail.close()
         mail.logout()
@@ -236,23 +215,9 @@ def check_single_email_blocking(cfg):
     except Exception as e:
         print(f"[ERROR] {cfg['address']}: {e}")
 
-# --------------------- BACKGROUND LOOP ---------------------
+# ———— Background Loop ————
 def email_check_loop():
     while True:
         print(f"\n[CYCLE] Checking {len(email_configs)} accounts...")
         for cfg in email_configs:
-            check_single_email_blocking(cfg)
-        time.sleep(30)
-
-# --------------------- BOT START ---------------------
-@bot.event
-async def on_ready():
-    print(f'{bot.user} online! History saved to seen_uids.json')
-    thread = threading.Thread(target=email_check_loop, daemon=True)
-    thread.start()
-
-# Save on exit
-import atexit
-atexit.register(save_seen_uids)
-
-bot.run(TOKEN)
+            check_single_email_blocking(cfg
