@@ -1,0 +1,3 @@
+.env
+info.env
+seen_uids.json  # Optional: history file
