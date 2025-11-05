@@ -223,20 +223,7 @@ def extract_sender_info(text):
     sender_email = email_match.group(0).lower() if email_match else None
 
     return name or phone or sender_email or "Unknown Sender"
+
 @bot.event
 async def on_ready():
-    print(f"[DEBUG] Logged in as: {bot.user}")
-    print("[DEBUG] Starting email polling thread...")
-    thread = threading.Thread(target=email_check_loop, daemon=True)
-    thread.start()
-
-import atexit
-atexit.register(save_seen_uids)
-
-print("[DEBUG] Calling bot.run()")
-try:
-    bot.run(TOKEN)
-except discord.LoginFailure:
-    print("[ERROR] Invalid Discord token")
-except Exception as e:
-    print(f"[ERROR] Unexpected: {e}")
+    print(f"[DEBUG] Logged in as
