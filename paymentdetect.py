@@ -32,11 +32,15 @@ while True:
     addr = os.getenv(f'EMAIL_{i}_ADDRESS')
     if not addr:
         break
+    try:
+        channel_id = int(os.getenv(f'EMAIL_{i}_CHANNEL'))
+    except (TypeError, ValueError):
+        channel_id = None
     email_configs.append({
         'address': addr,
         'password': os.getenv(f'EMAIL_{i}_PASSWORD'),
         'imap': os.getenv(f'EMAIL_{i}_IMAP', 'imap.gmail.com'),
-        'channel_id': int(os.getenv(f'EMAIL_{i}_CHANNEL')),
+        'channel_id': channel_id,
     })
     i += 1
 
@@ -53,14 +57,13 @@ SEEN_FILE = "seen_uids.json"
 
 def load_seen_uids():
     if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE, 'r') as f:
+        with open(SEEN_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
             return {k: set(v) for k, v in data.items()}
-    # initialize per configured address
     return {cfg['address']: set() for cfg in email_configs}
 
 def save_seen_uids():
-    with open(SEEN_FILE, 'w') as f:
+    with open(SEEN_FILE, 'w', encoding='utf-8') as f:
         json.dump({k: list(v) for k, v in seen_uids.items()}, f)
 
 seen_uids = load_seen_uids()
@@ -82,22 +85,23 @@ def check_single_email_blocking(cfg):
         since_date = (datetime.now() - timedelta(hours=1)).strftime('%d-%b-%Y')
         status, data = mail.search(None, f'(SINCE "{since_date}")')
         if status != 'OK':
-            print(f"[DEBUG] Search failed")
+            print(f"[DEBUG] Search failed for {cfg['address']}")
             mail.close()
             mail.logout()
             return
 
         uids = data[0].split()
         if not uids or uids == [b'']:
-            print(f"[DEBUG] No new emails")
+            print(f"[DEBUG] No new emails for {cfg['address']}")
             mail.close()
             mail.logout()
             return
 
-        print(f"[DEBUG] Found {len(uids)} email(s)")
-        channel = bot.get_channel(cfg['channel_id'])
+        print(f"[DEBUG] Found {len(uids)} email(s) for {cfg['address']}")
+        channel = bot.get_channel(cfg['channel_id']) if cfg['channel_id'] else None
         if not channel:
-            print(f"[ERROR] Channel not found for id {cfg['channel_id']}!")
+            print(f"[ERROR] Channel not found or not configured for account {cfg['address']} (id={cfg['channel_id']})")
+            # still mark as processed to avoid constant reprocessing if desired; here we skip processing
             mail.close()
             mail.logout()
             return
@@ -113,6 +117,10 @@ def check_single_email_blocking(cfg):
 
             raw_email = msg_data[0][1]
             msg = email.message_from_bytes(raw_email)
+
+            # OPTIONAL debug dump (comment out in production)
+            # dump_email_for_debug(uid, msg)
+
             result = parse_email(msg)
 
             if result:
@@ -141,13 +149,13 @@ def check_single_email_blocking(cfg):
 def parse_email(msg):
     subject_header = msg.get("Subject", "")
     decoded = decode_header(subject_header)[0][0]
-    subject = decoded.decode() if isinstance(decoded, bytes) else decoded
+    subject = decoded.decode(errors='ignore') if isinstance(decoded, bytes) else (decoded or "")
 
     body = ""
     if msg.is_multipart():
         for part in msg.walk():
             ctype = part.get_content_type()
-            disp = str(part.get("Content-Disposition"))
+            disp = str(part.get("Content-Disposition") or "")
             if ctype == "text/plain" and "attachment" not in disp:
                 payload = part.get_payload(decode=True)
                 if payload:
@@ -167,17 +175,22 @@ def parse_email(msg):
     full_text = f"{subject}\n{body}"
     from_hdr = email.utils.parseaddr(msg.get("From", ""))[1].lower()
 
+    # Broadened service detection (PayPal relaxed)
     service = None
     if 'zelle' in from_hdr or 'zelle' in full_text.lower():
         service = 'Zelle'
     elif 'chime' in from_hdr or 'chime' in full_text.lower():
         service = 'Chime'
-    elif 'paypal' in from_hdr or 'paypal' in full_text.lower():
-        service = 'PayPal'
     elif 'cash' in from_hdr or 'cashapp' in from_hdr:
         service = 'Cash App'
     elif 'venmo' in from_hdr or 'venmo.com' in from_hdr:
         service = 'Venmo'
+    elif ('paypal' in from_hdr) or ('paypal' in full_text.lower()) or \
+         ('sent you' in full_text.lower()) or ('transaction id' in full_text.lower()) or \
+         ('payment received' in full_text.lower()):
+        service = 'PayPal'
+    else:
+        service = None
 
     if not service:
         return None
@@ -198,14 +211,19 @@ def extract_amount_and_sender(text, service):
         'Zelle': [r'You received \$?([\d,]+\.?\d*) from'],
         'Chime': [r'You just got paid \$?([\d,]+\.?\d*)'],
         'PayPal': [
-            r'You received a payment of \$?([\d,]+\.?\d*)',
-            r'You received \$?([\d,]+\.?\d*)',
-            r'Payment received[:\s]+\$?([\d,]+\.?\d*)',
-            r"You've got money.+?\$?([\d,]+\.?\d*)",
-            r"([A-Z][a-z]+(?:\s[A-Z][a-z]+)?) sent you \$?([\d,]+\.?\d*) USD"
+            r'You received a payment of \$?([\d,]+(?:\.\d{1,2})?)',
+            r'You received \$?([\d,]+(?:\.\d{1,2})?)',
+            r'Payment received[:\s]+\$?([\d,]+(?:\.\d{1,2})?)',
+            r"You've got money.+?\$?([\d,]+(?:\.\d{1,2})?)",
+            # relaxed sender+amount tolerant of newlines and varied names
+            r"([A-Za-z][A-Za-z'\-\.\s]{1,120}?)\s+sent\s+you\s+\$?([\d,]+(?:\.\d{1,2})?)\s*USD",
+            # fallback: find amount anywhere with a nearby name-like token
+            r'([A-Za-z][A-Za-z\'\-\.\s]{1,120})[\s\:\-]{1,5}.*?\$([\d,]+(?:\.\d{1,2})?)',
+            # fallback: any dollar amount
+            r'\$?([\d,]+(?:\.\d{1,2})?)\s*USD'
         ],
-        'Cash App': [r'Cash App.+?\$?([\d,]+\.?\d*)'],
-        'Venmo': [r'paid you \$?([\d,]+\.?\d*)'],
+        'Cash App': [r'Cash App.+?\$?([\d,]+(?:\.\d{1,2})?)'],
+        'Venmo': [r'paid you \$?([\d,]+(?:\.\d{1,2})?)'],
     }
 
     for pattern in patterns.get(service, []):
@@ -213,14 +231,23 @@ def extract_amount_and_sender(text, service):
         if not match:
             continue
 
-        # PayPal pattern that captures sender and amount
-        if service == 'PayPal' and len(match.groups()) == 2:
-            sender = match.group(1).strip()
-            amount_str = re.sub(r'[^\d.]', '', match.group(2).strip())
+        # If pattern captured two groups for sender+amount
+        if service == 'PayPal' and len(match.groups()) >= 2:
+            # choose last group as amount if ambiguous
+            if re.match(r'^[A-Za-z]', match.group(1)):
+                sender = match.group(1).strip()
+                amount_candidate = match.group(2)
+            else:
+                sender = extract_sender_info(text)
+                amount_candidate = match.group(1) if match.group(1) else match.group(2)
         else:
-            amount_str = re.sub(r'[^\d.]', '', match.group(1).strip())
+            amount_candidate = match.group(1)
             sender = extract_sender_info(text)
 
+        if not amount_candidate:
+            continue
+
+        amount_str = re.sub(r'[^\d.]', '', amount_candidate)
         try:
             amount = float(amount_str)
             if amount <= 0:
@@ -228,10 +255,12 @@ def extract_amount_and_sender(text, service):
             return amount, sender
         except (ValueError, TypeError):
             continue
+
     return None, None
 
 def extract_sender_info(text):
-    name_match = re.search(r'(?:from|sent by|paid by)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)', text, re.IGNORECASE)
+    # try common sender patterns
+    name_match = re.search(r'(?:from|sent by|paid by)\s+([A-Z][A-Za-z\'\-\.\s]{1,80}?)', text, re.IGNORECASE)
     name = name_match.group(1).strip() if name_match else None
 
     phone_match = re.search(r'(\+?\d{1,3}[-.\s]?\(?\d{2,4}\)?[-.\s]?\d{2,4}[-.\s]?\d{2,4})', text)
@@ -243,7 +272,11 @@ def extract_sender_info(text):
     email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
     sender_email = email_match.group(0).lower() if email_match else None
 
-    return name or phone or sender_email or "Unknown Sender"
+    # last resort: try to extract a "Name sent you" pattern
+    sent_name_match = re.search(r"^([A-Za-z][A-Za-z'\-\.\s]{1,80}?)\s+sent\s+you", text, re.IGNORECASE | re.MULTILINE)
+    sent_name = sent_name_match.group(1).strip() if sent_name_match else None
+
+    return name or sent_name or phone or sender_email or "Unknown Sender"
 
 @bot.event
 async def on_ready():
