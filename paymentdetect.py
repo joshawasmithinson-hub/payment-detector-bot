@@ -215,7 +215,4 @@ def email_check_loop():
     while True:
         print(f"\n[CYCLE] Checking {len(email_configs)} accounts...")
         for cfg in email_configs:
-            check_single_email_blocking(cfg)
-        time.sleep(30)
-
-@bot.event
+            check_single_email_blocking
