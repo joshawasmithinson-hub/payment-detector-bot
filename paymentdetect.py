@@ -226,4 +226,12 @@ def extract_sender_info(text):
 
 @bot.event
 async def on_ready():
-    print(f"[DEBUG] Logged in as
+    print(f"[DEBUG] Logged in as: {bot.user}")
+    print("[DEBUG] Starting email polling thread...")
+    thread = threading.Thread(target=email_check_loop, daemon=True)
+    thread.start()
+
+import atexit
+atexit.register(save_seen_uids)
+
+print("[DEBUG] Calling bot.run()
