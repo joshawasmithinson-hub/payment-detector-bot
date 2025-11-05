@@ -1,6 +1,15 @@
 print("[BOOT] paymentdetect.py is running")
 
-import os, re, imaplib, email, asyncio, discord, threading, time, json
+import os
+import re
+import imaplib
+import email
+import asyncio
+import discord
+import threading
+import time
+import json
+import atexit
 from email.header import decode_header
 from datetime import datetime, timedelta
 from discord.ext import commands
@@ -47,6 +56,7 @@ def load_seen_uids():
         with open(SEEN_FILE, 'r') as f:
             data = json.load(f)
             return {k: set(v) for k, v in data.items()}
+    # initialize per configured address
     return {cfg['address']: set() for cfg in email_configs}
 
 def save_seen_uids():
@@ -87,16 +97,18 @@ def check_single_email_blocking(cfg):
         print(f"[DEBUG] Found {len(uids)} email(s)")
         channel = bot.get_channel(cfg['channel_id'])
         if not channel:
-            print(f"[ERROR] Channel not found!")
+            print(f"[ERROR] Channel not found for id {cfg['channel_id']}!")
+            mail.close()
+            mail.logout()
             return
 
         for uid in uids:
             uid = uid.decode()
-            if uid in seen_uids[cfg['address']]:
+            if uid in seen_uids.get(cfg['address'], set()):
                 continue
 
             status, msg_data = mail.fetch(uid, '(RFC822)')
-            if status != 'OK':
+            if status != 'OK' or not msg_data or not msg_data[0]:
                 continue
 
             raw_email = msg_data[0][1]
@@ -112,11 +124,12 @@ def check_single_email_blocking(cfg):
                 )
                 embed.add_field(name="Amount", value=f"${result['amount']:,.2f}", inline=True)
                 embed.add_field(name="From", value=result['sender'], inline=True)
-                embed.set_footer(text=f"Subject: {result['subject'][:100]}...")
+                embed.set_footer(text=f"Subject: {result['subject'][:100]}")
 
                 asyncio.run_coroutine_threadsafe(channel.send(embed=embed), bot.loop)
 
-            seen_uids[cfg['address']].add(uid)
+            # mark seen and persist
+            seen_uids.setdefault(cfg['address'], set()).add(uid)
             save_seen_uids()
 
         mail.close()
@@ -126,23 +139,30 @@ def check_single_email_blocking(cfg):
         print(f"[ERROR] {cfg['address']}: {e}")
 
 def parse_email(msg):
-    subject = decode_header(msg.get("Subject", ""))[0][0]
-    if isinstance(subject, bytes):
-        subject = subject.decode()
+    subject_header = msg.get("Subject", "")
+    decoded = decode_header(subject_header)[0][0]
+    subject = decoded.decode() if isinstance(decoded, bytes) else decoded
 
     body = ""
     if msg.is_multipart():
         for part in msg.walk():
             ctype = part.get_content_type()
-            if ctype == "text/plain":
-                body = part.get_payload(decode=True).decode(errors='ignore')
-                break
+            disp = str(part.get("Content-Disposition"))
+            if ctype == "text/plain" and "attachment" not in disp:
+                payload = part.get_payload(decode=True)
+                if payload:
+                    body = payload.decode(errors='ignore')
+                    break
             elif ctype == "text/html" and not body:
-                html = part.get_payload(decode=True).decode(errors='ignore')
-                soup = BeautifulSoup(html, "html.parser")
-                body = soup.get_text(separator='\n')
+                payload = part.get_payload(decode=True)
+                if payload:
+                    html = payload.decode(errors='ignore')
+                    soup = BeautifulSoup(html, "html.parser")
+                    body = soup.get_text(separator='\n')
     else:
-        body = msg.get_payload(decode=True).decode(errors='ignore')
+        payload = msg.get_payload(decode=True)
+        if payload:
+            body = payload.decode(errors='ignore')
 
     full_text = f"{subject}\n{body}"
     from_hdr = email.utils.parseaddr(msg.get("From", ""))[1].lower()
@@ -170,7 +190,7 @@ def parse_email(msg):
         'service': service,
         'amount': amount,
         'sender': sender,
-        'subject': subject
+        'subject': subject or ""
     }
 
 def extract_amount_and_sender(text, service):
@@ -193,6 +213,7 @@ def extract_amount_and_sender(text, service):
         if not match:
             continue
 
+        # PayPal pattern that captures sender and amount
         if service == 'PayPal' and len(match.groups()) == 2:
             sender = match.group(1).strip()
             amount_str = re.sub(r'[^\d.]', '', match.group(2).strip())
@@ -205,7 +226,7 @@ def extract_amount_and_sender(text, service):
             if amount <= 0:
                 continue
             return amount, sender
-        except ValueError:
+        except (ValueError, TypeError):
             continue
     return None, None
 
@@ -213,7 +234,7 @@ def extract_sender_info(text):
     name_match = re.search(r'(?:from|sent by|paid by)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)', text, re.IGNORECASE)
     name = name_match.group(1).strip() if name_match else None
 
-    phone_match = re.search(r'(\+?\d{1,3}[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})', text)
+    phone_match = re.search(r'(\+?\d{1,3}[-.\s]?\(?\d{2,4}\)?[-.\s]?\d{2,4}[-.\s]?\d{2,4})', text)
     phone = re.sub(r'[^\d+]', '', phone_match.group(1)) if phone_match else None
     if phone:
         phone = phone[-10:]
@@ -227,3 +248,18 @@ def extract_sender_info(text):
 @bot.event
 async def on_ready():
     print(f"[DEBUG] Logged in as: {bot.user}")
+    print("[DEBUG] Starting email polling thread...")
+    thread = threading.Thread(target=email_check_loop, daemon=True)
+    thread.start()
+
+# ensure seen file is saved on exit
+atexit.register(save_seen_uids)
+
+# Run bot
+print("[DEBUG] Calling bot.run()")
+try:
+    bot.run(TOKEN)
+except discord.LoginFailure:
+    print("[ERROR] Invalid Discord token")
+except Exception as e:
+    print(f"[ERROR] Unexpected: {e}")
