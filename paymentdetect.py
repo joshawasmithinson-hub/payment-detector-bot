@@ -5,11 +5,11 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-# ———— Load Environment Variables ————
+# Load environment variables
 load_dotenv("info.env")
 TOKEN = os.getenv('DISCORD_TOKEN')
 
-# ———— Load Email Configs ————
+# Load email configs
 email_configs = []
 i = 1
 while True:
@@ -30,7 +30,7 @@ if not email_configs:
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# ———— Persistent Seen UIDs ————
+# Persistent UID tracking
 SEEN_FILE = "seen_uids.json"
 
 def load_seen_uids():
@@ -46,7 +46,7 @@ def save_seen_uids():
 
 seen_uids = load_seen_uids()
 
-# ———— Payment Patterns ————
+# Payment patterns
 PATTERNS = {
     'Zelle': [r'You received \$?([\d,]+\.?\d*) from', r'Zelle.+?\$?([\d,]+\.?\d*)'],
     'Chime': [r'You just got paid \$?([\d,]+\.?\d*)', r'Chime.+?\$?([\d,]+\.?\d*)'],
@@ -60,7 +60,6 @@ PATTERNS = {
     'Venmo': [r'paid you \$?([\d,]+\.?\d*)'],
 }
 
-# ———— Extract Sender Info ————
 def extract_sender_info(text):
     name_match = re.search(r'(?:from|sent by|paid by)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)', text, re.IGNORECASE)
     name = name_match.group(1).strip() if name_match else None
@@ -76,7 +75,6 @@ def extract_sender_info(text):
 
     return name or phone or sender_email or "Unknown Sender"
 
-# ———— Extract Amount and Sender ————
 def extract_amount_and_sender(text, service):
     for pattern in PATTERNS.get(service, []):
         match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
@@ -93,7 +91,6 @@ def extract_amount_and_sender(text, service):
             continue
     return None, None
 
-# ———— Parse Email ————
 def parse_email(msg):
     subject = decode_header(msg.get("Subject", ""))[0][0]
     if isinstance(subject, bytes):
@@ -115,11 +112,6 @@ def parse_email(msg):
 
     full_text = f"{subject}\n{body}"
     from_hdr = email.utils.parseaddr(msg.get("From", ""))[1].lower()
-
-    # DEBUG LOGGING
-    # print("[DEBUG] From:", from_hdr)
-    # print("[DEBUG] Subject:", subject)
-    # print("[DEBUG] Body:", full_text[:500])
 
     service = None
     if 'zelle' in from_hdr or 'zelle' in full_text.lower():
@@ -147,7 +139,6 @@ def parse_email(msg):
         'subject': subject
     }
 
-# ———— Check One Email Account ————
 def check_single_email_blocking(cfg):
     try:
         print(f"[DEBUG] Logging into {cfg['address']}...")
@@ -215,9 +206,20 @@ def check_single_email_blocking(cfg):
     except Exception as e:
         print(f"[ERROR] {cfg['address']}: {e}")
 
-# ———— Background Loop ————
 def email_check_loop():
     while True:
         print(f"\n[CYCLE] Checking {len(email_configs)} accounts...")
         for cfg in email_configs:
-            check_single_email_blocking(cfg
+            check_single_email_blocking(cfg)
+        time.sleep(30)
+
+@bot.event
+async def on_ready():
+    print(f'{bot.user} online! History saved to seen_uids.json')
+    thread = threading.Thread(target=email_check_loop, daemon=True)
+    thread.start()
+
+import atexit
+atexit.register(save_seen_uids)
+
+bot.run(TOKEN)
