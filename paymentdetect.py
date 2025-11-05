@@ -82,8 +82,10 @@ def check_single_email_blocking(cfg):
         mail.login(cfg['address'], cfg['password'])
         mail.select('inbox')
 
-        # Use UNSEEN to avoid conversation/thread confusion
-        status, data = mail.search(None, 'UNSEEN')
+        # Use UNSEEN + SINCE 1 hour to target unread messages within last hour
+        since_date = (datetime.now() - timedelta(hours=1)).strftime('%d-%b-%Y')
+        # combine UNSEEN and SINCE to reduce thread/stack issues while keeping 1-hour window
+        status, data = mail.search(None, f'(UNSEEN SINCE "{since_date}")')
         if status != 'OK':
             print(f"[DEBUG] Search failed for {cfg['address']}")
             mail.close()
