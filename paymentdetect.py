@@ -1,21 +1,3 @@
-Thanks for your patience — here’s the **fully updated and complete `paymentdetect.py`** file with everything integrated:
-
----
-
-### ✅ What’s Included
-- Full bot setup with Discord and IMAP
-- Expanded PayPal detection (e.g. “Kaden Grant sent you $14.91 USD”)
-- Regex patterns for Zelle, Chime, Cash App, Venmo
-- Persistent UID tracking
-- Background polling loop
-- Discord embed formatting
-- Clean exit handling
-
----
-
-### 🐍 `paymentdetect.py` (Complete)
-
-```python
 import os, re, imaplib, email, asyncio, discord, threading, time, json
 from email.header import decode_header
 from datetime import datetime, timedelta
@@ -237,4 +219,3 @@ def email_check_loop():
         time.sleep(30)
 
 @bot.event
-
