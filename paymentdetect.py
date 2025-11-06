@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 paymentdetect.py
-- always-running polling loop (Option B)
-- INTERNALDATE 2-hour filter (USE_READ_2H)
-- SHOW_ONLY_NEW enforcement
-- robust fetch using BODY.PEEK[] INTERNALDATE
-- fixed get_search_query using local time to avoid future-date SINCE
-Debug flags via info.env: VERBOSE_DEBUG, USE_HOUR_WINDOW, USE_READ_2H, SHOW_ONLY_NEW
+- Always-running polling loop
+- Enforce 2-hour window using IMAP INTERNALDATE at fetch time
+- Server-side search uses UNSEEN to avoid date-granularity/timezone issues
+- SHOW_ONLY_NEW enforcement and UID persistence
+- Debug flags via info.env: VERBOSE_DEBUG, USE_READ_2H, SHOW_ONLY_NEW
 Environment: info.env loaded by python-dotenv with DISCORD_TOKEN and EMAIL_1_ADDRESS/_PASSWORD/_IMAP/_CHANNEL.
 """
 import os
@@ -32,7 +31,6 @@ print("[BOOT] starting paymentdetect.py")
 # Load env
 load_dotenv("info.env")
 VERBOSE = os.getenv("VERBOSE_DEBUG", "false").lower() in ("1", "true", "yes")
-USE_HOUR_WINDOW = os.getenv("USE_HOUR_WINDOW", "false").lower() in ("1", "true", "yes")
 USE_READ_2H = os.getenv("USE_READ_2H", "true").lower() in ("1", "true", "yes")
 SHOW_ONLY_NEW = os.getenv("SHOW_ONLY_NEW", "true").lower() in ("1", "true", "yes")
 
@@ -89,33 +87,9 @@ seen_uids = load_seen_uids()
 
 def get_search_query():
     """
-    Compute SINCE date safely using local timezone before subtraction so we never produce a future date.
-    - If USE_READ_2H: return '(SEEN SINCE "dd-Mon-YYYY")' using local date of (now_local - 2h).
-    - If USE_HOUR_WINDOW: return '(UNSEEN SINCE "dd-Mon-YYYY")' using local date of (now_local - 1h).
-    - Otherwise return 'UNSEEN'.
+    Use UNSEEN server-side (avoid SINCE date granularity/timezone issues).
+    Rely on INTERNALDATE checks at fetch time for strict 2-hour window.
     """
-    # get local aware now
-    now_local = datetime.now().astimezone()
-    if USE_READ_2H:
-        ref_local = (now_local - timedelta(hours=2)).date()
-    elif USE_HOUR_WINDOW:
-        ref_local = (now_local - timedelta(hours=1)).date()
-    else:
-        return "UNSEEN"
-
-    # clamp to today's local date to avoid future day
-    today_local = now_local.date()
-    if ref_local > today_local:
-        ref_local = today_local
-
-    since_date = ref_local.strftime("%d-%b-%Y")
-    if VERBOSE:
-        print(f"[DEBUG] get_search_query computed since_date={since_date} (local now={now_local.isoformat()})")
-
-    if USE_READ_2H:
-        return f'(SEEN SINCE "{since_date}")'
-    if USE_HOUR_WINDOW:
-        return f'(UNSEEN SINCE "{since_date}")'
     return "UNSEEN"
 
 def email_check_loop():
@@ -161,10 +135,12 @@ def email_check_loop():
                     pass
                 continue
 
+            # show a few candidate UIDs
             for uid_b in uids[:5]:
                 uid = uid_b.decode()
                 print(f"[IMAP][{addr}] Candidate UID: {uid} (seen_in_map={uid in seen_uids.get(addr, set())})")
 
+            # process candidates
             for uid_b in uids:
                 uid = uid_b.decode()
                 seen_set = seen_uids.setdefault(addr, set())
@@ -208,6 +184,7 @@ def email_check_loop():
                         print(f"[DEBUG] No raw email bytes found for uid {uid}")
                     continue
 
+                # enforce 2-hour window using INTERNALDATE if enabled
                 if USE_READ_2H:
                     if not internaldate_raw:
                         if VERBOSE:
@@ -484,7 +461,7 @@ async def on_ready():
     print(f"[READY] Logged in as: {bot.user} (id: {getattr(bot.user,'id',None)})")
     guilds = [f"{g.name}(id:{g.id})" for g in bot.guilds]
     print("[READY] Guilds:", guilds)
-    print("[READY] Email configs loaded:", email_configs)
+    print(f"[READY] Loaded {len(email_configs)} email config(s)")
     for cfg in email_configs:
         print(f"[READY] Config for {cfg['address']}: channel_id={cfg.get('channel_id')} imap={cfg.get('imap')}")
     def start_thread():
