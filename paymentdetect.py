@@ -4,15 +4,14 @@ paymentdetect.py
 Detect payments (Zelle, PayPal, Chime, Cash App, Venmo) and post to Discord.
 
 Behavior:
-- By default, searches UNSEEN messages and posts only new UIDs (SHOW_ONLY_NEW=true).
-- To only show messages received in the past 2 hours, set USE_READ_2H=true in info.env.
-  This enforces Date-header filtering in Python to guarantee an exact 2-hour window.
-- To use a 1-hour UNSEEN SINCE fallback mode, set USE_HOUR_WINDOW=true.
+- By default searches UNSEEN messages and posts only new UIDs (SHOW_ONLY_NEW=true).
+- USE_READ_2H=true enforces a strict "received in last 2 hours" filter using the IMAP INTERNALDATE (server timestamp).
+- USE_HOUR_WINDOW=true will use UNSEEN SINCE 1 hour as an alternate server-side narrowing (less precise).
 - Uses BODY.PEEK[] to avoid marking messages read.
 - Persists seen UIDs per account in seen_uids.json.
 - Dumps non-matching parsed emails to debug_email_dump.txt.
 - Optional verbose debug via VERBOSE_DEBUG env var.
-Environment: info.env loaded by python-dotenv with DISCORD_TOKEN and EMAIL_1_ADDRESS / _PASSWORD / _IMAP / _CHANNEL, etc.
+Environment: info.env loaded by python-dotenv with DISCORD_TOKEN and EMAIL_1_ADDRESS/_PASSWORD/_IMAP/_CHANNEL, etc.
 """
 import os
 import re
@@ -37,7 +36,7 @@ print("[BOOT] paymentdetect.py is running")
 load_dotenv("info.env")
 VERBOSE = os.getenv("VERBOSE_DEBUG", "false").lower() in ("1", "true", "yes")
 USE_HOUR_WINDOW = os.getenv("USE_HOUR_WINDOW", "false").lower() in ("1", "true", "yes")
-USE_READ_2H = os.getenv("USE_READ_2H", "false").lower() in ("1", "true", "yes")
+USE_READ_2H = os.getenv("USE_READ_2H", "true").lower() in ("1", "true", "yes")
 SHOW_ONLY_NEW = os.getenv("SHOW_ONLY_NEW", "true").lower() in ("1", "true", "yes")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -92,10 +91,9 @@ seen_uids = load_seen_uids()
 def get_search_query():
     """
     Return an IMAP search query string.
-    Note: SINCE may be day-granular on some IMAP servers; USE_READ_2H always applies exact 2-hour filtering by Date header.
+    Note: SINCE may be day-granular on some IMAP servers; USE_READ_2H enforces exact 2-hour filtering locally via INTERNALDATE.
     """
     if USE_READ_2H:
-        # Narrow server-side using SEEN SINCE to reduce results; exact 2-hour filtering happens locally.
         since_date = (datetime.now() - timedelta(hours=2)).strftime("%d-%b-%Y")
         return f'(SEEN SINCE "{since_date}")'
     if USE_HOUR_WINDOW:
@@ -164,67 +162,79 @@ def check_single_email_blocking(cfg):
                     print(f"[DEBUG] Skipping already-seen UID {uid} for {addr}")
                 continue
 
+            # Fetch BODY.PEEK[] and INTERNALDATE for reliable server timestamp
             if VERBOSE:
-                print(f"[IMAP] Fetching UID {uid} (BODY.PEEK[] FLAGS)")
+                print(f"[IMAP] Fetching UID {uid} (BODY.PEEK[] INTERNALDATE)")
             try:
-                status, msg_data = mail.fetch(uid_b, "(BODY.PEEK[] FLAGS)")
+                status, msg_data = mail.fetch(uid_b, '(BODY.PEEK[] INTERNALDATE)')
             except Exception as e:
                 print(f"[ERROR] fetch failed for {addr} uid {uid}: {e}")
                 continue
 
-            if status != "OK" or not msg_data or not msg_data[0]:
+            if status != "OK" or not msg_data:
                 if VERBOSE:
                     print(f"[DEBUG] Empty fetch for uid {uid} ({status})")
                 continue
 
-            # Extract raw email bytes from fetch response
+            # Extract raw email bytes and INTERNALDATE token
             raw_email = None
+            internaldate_raw = None
+            # msg_data commonly contains tuples and other items; inspect all
             for part in msg_data:
                 if isinstance(part, tuple) and part[1]:
-                    raw_email = part[1]
-                    break
+                    # part[1] is the raw bytes of the message when present
+                    # prefer the largest bytes blob if multiple are present
+                    if raw_email is None or (isinstance(part[1], (bytes, bytearray)) and len(part[1]) > len(raw_email)):
+                        raw_email = part[1]
+                # other parts may be bytes containing the metadata line with INTERNALDATE
+                if isinstance(part, bytes):
+                    m = re.search(rb'INTERNALDATE\s+"([^"]+)"', part)
+                    if m:
+                        internaldate_raw = m.group(1).decode(errors='ignore')
+
+            # fallback: attempt to extract INTERNALDATE from first element header bytes if present
+            if internaldate_raw is None and isinstance(msg_data[0], tuple) and isinstance(msg_data[0][0], bytes):
+                m = re.search(rb'INTERNALDATE\s+"([^"]+)"', msg_data[0][0])
+                if m:
+                    internaldate_raw = m.group(1).decode(errors='ignore')
+
             if raw_email is None:
                 if VERBOSE:
                     print(f"[DEBUG] No raw email bytes found for uid {uid}")
                 continue
 
+            # If USE_READ_2H enforce 2-hour cutoff using INTERNALDATE (server timestamp)
+            if USE_READ_2H:
+                if not internaldate_raw:
+                    if VERBOSE:
+                        print(f"[WARN] No INTERNALDATE for uid {uid}; skipping in 2-hour mode")
+                    seen_set.add(uid); save_seen_uids()
+                    continue
+                try:
+                    dt = parsedate_to_datetime(internaldate_raw)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    age = datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
+                    if age > timedelta(hours=2):
+                        if VERBOSE:
+                            print(f"[DEBUG] UID {uid} INTERNALDATE {dt.isoformat()} older than 2 hours; skipping")
+                        seen_set.add(uid); save_seen_uids()
+                        continue
+                except Exception as e:
+                    if VERBOSE:
+                        print(f"[WARN] Failed to parse INTERNALDATE for uid {uid}: {e}")
+                    seen_set.add(uid); save_seen_uids()
+                    continue
+
+            # Parse the email object
             try:
                 msg = email.message_from_bytes(raw_email)
             except Exception as e:
                 print(f"[ERROR] parsing email bytes uid {uid}: {e}")
-                seen_set.add(uid)
-                save_seen_uids()
+                seen_set.add(uid); save_seen_uids()
                 continue
 
-            # If USE_READ_2H: enforce exact 2-hour window by Date header
-            if USE_READ_2H:
-                date_hdr = msg.get("Date")
-                if date_hdr:
-                    try:
-                        dt = parsedate_to_datetime(date_hdr)
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                        age = datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
-                        if age > timedelta(hours=2):
-                            if VERBOSE:
-                                print(f"[DEBUG] UID {uid} Date {dt.isoformat()} older than 2 hours; skipping")
-                            seen_set.add(uid)
-                            save_seen_uids()
-                            continue
-                    except Exception as e:
-                        if VERBOSE:
-                            print(f"[WARN] Failed to parse Date header for uid {uid}: {e}")
-                        # If Date parsing fails, skip the message to be safe
-                        seen_set.add(uid)
-                        save_seen_uids()
-                        continue
-                else:
-                    if VERBOSE:
-                        print(f"[WARN] No Date header for uid {uid}; skipping for USE_READ_2H mode")
-                    seen_set.add(uid)
-                    save_seen_uids()
-                    continue
-
+            # Parse and detect payment
             result, full_text = parse_email(msg, return_full_text=True)
 
             if result:
@@ -383,6 +393,7 @@ def extract_amount_and_sender(text, service):
         if not match:
             continue
 
+        # If two groups captured (name + amount)
         if service in ("Zelle", "PayPal") and len(match.groups()) >= 2:
             sender_candidate = match.group(1).strip()
             amount_candidate = match.group(2)
