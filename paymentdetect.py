@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
 paymentdetect.py
-Full script with:
-- always-running polling loop
-- reliable INTERNALDATE 2-hour filter (USE_READ_2H)
+- always-running polling loop (Option B)
+- INTERNALDATE 2-hour filter (USE_READ_2H)
 - SHOW_ONLY_NEW enforcement
 - robust fetch using BODY.PEEK[] INTERNALDATE
-- fixed get_search_query to avoid future-date SINCE values
-- explicit on_ready diagnostics and guaranteed email polling thread start
+- fixed get_search_query using local time to avoid future-date SINCE
 Debug flags via info.env: VERBOSE_DEBUG, USE_HOUR_WINDOW, USE_READ_2H, SHOW_ONLY_NEW
 Environment: info.env loaded by python-dotenv with DISCORD_TOKEN and EMAIL_1_ADDRESS/_PASSWORD/_IMAP/_CHANNEL.
 """
@@ -91,33 +89,28 @@ seen_uids = load_seen_uids()
 
 def get_search_query():
     """
-    Build an IMAP search clause safely. Compute an aware UTC timestamp,
-    convert to local date and clamp to today to avoid future dates.
-
-    USE_READ_2H  -> (SEEN SINCE "dd-Mon-YYYY")
-    USE_HOUR_WINDOW -> (UNSEEN SINCE "dd-Mon-YYYY")
-    otherwise -> "UNSEEN"
+    Compute SINCE date safely using local timezone before subtraction so we never produce a future date.
+    - If USE_READ_2H: return '(SEEN SINCE "dd-Mon-YYYY")' using local date of (now_local - 2h).
+    - If USE_HOUR_WINDOW: return '(UNSEEN SINCE "dd-Mon-YYYY")' using local date of (now_local - 1h).
+    - Otherwise return 'UNSEEN'.
     """
-    # compute reference times in UTC then convert to local date
-    now_utc = datetime.now(timezone.utc)
+    # get local aware now
+    now_local = datetime.now().astimezone()
     if USE_READ_2H:
-        ref = now_utc - timedelta(hours=2)
+        ref_local = (now_local - timedelta(hours=2)).date()
     elif USE_HOUR_WINDOW:
-        ref = now_utc - timedelta(hours=1)
+        ref_local = (now_local - timedelta(hours=1)).date()
     else:
-        # UNSEEN mode doesn't need SINCE
         return "UNSEEN"
 
-    # convert to local timezone date
-    local_date = ref.astimezone().date()
-    today_local = datetime.now().astimezone().date()
-    # safety clamp: never return a date in the future
-    if local_date > today_local:
-        local_date = today_local
+    # clamp to today's local date to avoid future day
+    today_local = now_local.date()
+    if ref_local > today_local:
+        ref_local = today_local
 
-    since_date = local_date.strftime("%d-%b-%Y")
+    since_date = ref_local.strftime("%d-%b-%Y")
     if VERBOSE:
-        print(f"[DEBUG] get_search_query computed since_date={since_date} (USE_READ_2H={USE_READ_2H}, USE_HOUR_WINDOW={USE_HOUR_WINDOW})")
+        print(f"[DEBUG] get_search_query computed since_date={since_date} (local now={now_local.isoformat()})")
 
     if USE_READ_2H:
         return f'(SEEN SINCE "{since_date}")'
@@ -126,7 +119,6 @@ def get_search_query():
     return "UNSEEN"
 
 def email_check_loop():
-    # run_cycle does the per-account check and prints verbose info when VERBOSE is True
     def run_cycle():
         now = datetime.now().isoformat()
         print(f"[CYCLE] Checking {len(email_configs)} accounts at {now}")
@@ -169,12 +161,10 @@ def email_check_loop():
                     pass
                 continue
 
-            # show a few candidate UIDs
             for uid_b in uids[:5]:
                 uid = uid_b.decode()
                 print(f"[IMAP][{addr}] Candidate UID: {uid} (seen_in_map={uid in seen_uids.get(addr, set())})")
 
-            # process candidates
             for uid_b in uids:
                 uid = uid_b.decode()
                 seen_set = seen_uids.setdefault(addr, set())
@@ -218,7 +208,6 @@ def email_check_loop():
                         print(f"[DEBUG] No raw email bytes found for uid {uid}")
                     continue
 
-                # enforce 2-hour window using INTERNALDATE if enabled
                 if USE_READ_2H:
                     if not internaldate_raw:
                         if VERBOSE:
@@ -251,10 +240,8 @@ def email_check_loop():
                     continue
 
                 result, full_text = parse_email(msg, return_full_text=True)
-                channel = None
                 cfg_channel_id = cfg.get("channel_id")
-                if cfg_channel_id:
-                    channel = bot.get_channel(cfg_channel_id)
+                channel = bot.get_channel(cfg_channel_id) if cfg_channel_id else None
 
                 if result:
                     if SHOW_ONLY_NEW and uid in seen_set:
@@ -308,7 +295,7 @@ def email_check_loop():
         time.sleep(30)
 
 def check_single_email_blocking(cfg):
-    # kept for compatibility; not used by new loop but harmless fallback
+    # fallback function (not used by main loop)
     addr = cfg["address"]
     if VERBOSE:
         print(f"[IMAP] Starting single check for {addr}")
@@ -500,7 +487,6 @@ async def on_ready():
     print("[READY] Email configs loaded:", email_configs)
     for cfg in email_configs:
         print(f"[READY] Config for {cfg['address']}: channel_id={cfg.get('channel_id')} imap={cfg.get('imap')}")
-    # Start polling thread once
     def start_thread():
         try:
             thread = threading.Thread(target=email_check_loop, daemon=True)
