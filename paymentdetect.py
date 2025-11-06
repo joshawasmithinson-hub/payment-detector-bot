@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
 paymentdetect.py
-Improved detection for PayPal, Zelle, Chime, Cash App, Venmo.
-Features:
-- Configurable search mode: UNSEEN (default) or UNSEEN+SINCE 1 hour via USE_HOUR_WINDOW env var.
-- Uses BODY.PEEK[] to avoid marking messages read.
+Detect payments (Zelle, PayPal, Chime, Cash App, Venmo) and post to Discord.
+
+Features included:
 - Robust multipart/html extraction with BeautifulSoup.
-- Debug dumps for non-matching emails to debug_email_dump.txt.
-- Optional verbose IMAP/fetch debug via VERBOSE_DEBUG env var.
+- Improved Zelle detection (bank headlines, uppercase sender names).
+- Configurable IMAP search modes:
+  * Default: UNSEEN
+  * USE_HOUR_WINDOW=true -> UNSEEN SINCE 1 hour (best-effort; SINCE may be day-granular)
+  * USE_READ_2H=true -> search SEEN or ALL then filter messages by Date header to keep only those read within last 2 hours (precise hour filtering server-side)
+- Uses BODY.PEEK[] to avoid marking messages read on fetch.
 - Persists seen UIDs per account in seen_uids.json.
-Environment:
-- info.env file loaded by dotenv with DISCORD_TOKEN and EMAIL_1_ADDRESS / _PASSWORD / _IMAP / _CHANNEL, etc.
+- Dumps non-matching parsed emails to debug_email_dump.txt.
+- Optional verbose debug via VERBOSE_DEBUG env var.
+Environment: info.env loaded by python-dotenv with DISCORD_TOKEN and EMAIL_1_ADDRESS / _PASSWORD / _IMAP / _CHANNEL, etc.
 """
 import os
 import re
@@ -23,17 +27,19 @@ import time
 import json
 import atexit
 from email.header import decode_header
-from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timedelta, timezone
 from discord.ext import commands
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
 print("[BOOT] paymentdetect.py is running")
 
-# Load .env
+# Load env
 load_dotenv("info.env")
 VERBOSE = os.getenv("VERBOSE_DEBUG", "false").lower() in ("1", "true", "yes")
 USE_HOUR_WINDOW = os.getenv("USE_HOUR_WINDOW", "false").lower() in ("1", "true", "yes")
+USE_READ_2H = os.getenv("USE_READ_2H", "false").lower() in ("1", "true", "yes")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
@@ -55,7 +61,6 @@ while True:
     i += 1
 
 print(f"[DEBUG] Loaded {len(email_configs)} email config(s)")
-
 if not email_configs:
     raise SystemExit("No email configs found in info.env")
 
@@ -73,7 +78,7 @@ def load_seen_uids():
                 raw = json.load(f)
                 return {k: set(v) for k, v in raw.items()}
         except Exception as e:
-            print(f"[WARN] Failed to load seen uids: {e}")
+            print(f"[WARN] Failed to load seen_uids.json: {e}")
     return {cfg["address"]: set() for cfg in email_configs}
 
 def save_seen_uids():
@@ -81,22 +86,29 @@ def save_seen_uids():
         with open(SEEN_FILE, "w", encoding="utf-8") as f:
             json.dump({k: list(v) for k, v in seen_uids.items()}, f)
     except Exception as e:
-        print(f"[ERROR] Failed to save seen_uids: {e}")
+        print(f"[ERROR] Failed to save seen_uids.json: {e}")
 
 seen_uids = load_seen_uids()
 
 def get_search_query():
+    """
+    Return an IMAP search query string based on flags.
+    Note: SINCE may be day-granular on some IMAP servers; USE_READ_2H adds extra Date-header filtering.
+    """
+    if USE_READ_2H:
+        # We'll refine by Date header in Python; use SEEN SINCE to reduce returned set
+        since_date = (datetime.now() - timedelta(hours=2)).strftime("%d-%b-%Y")
+        return f'(SEEN SINCE "{since_date}")'
     if USE_HOUR_WINDOW:
         since_date = (datetime.now() - timedelta(hours=1)).strftime("%d-%b-%Y")
-        # combine UNSEEN + SINCE to focus on recent unread messages
         return f'(UNSEEN SINCE "{since_date}")'
-    # default: UNSEEN only
     return "UNSEEN"
 
 def email_check_loop():
     while True:
         try:
-            if VERBOSE: print(f"[CYCLE] Checking {len(email_configs)} accounts at {datetime.now().isoformat()}")
+            if VERBOSE:
+                print(f"[CYCLE] Checking {len(email_configs)} accounts at {datetime.now().isoformat()}")
             for cfg in email_configs:
                 check_single_email_blocking(cfg)
         except Exception as e:
@@ -106,7 +118,8 @@ def email_check_loop():
 def check_single_email_blocking(cfg):
     addr = cfg["address"]
     try:
-        if VERBOSE: print(f"[IMAP] Connecting to {cfg['imap']} for {addr}")
+        if VERBOSE:
+            print(f"[IMAP] Connecting to {cfg['imap']} for {addr}")
         mail = imaplib.IMAP4_SSL(cfg["imap"], timeout=30)
         mail.login(addr, cfg["password"])
         mail.select("inbox")
@@ -116,7 +129,8 @@ def check_single_email_blocking(cfg):
 
     try:
         query = get_search_query()
-        if VERBOSE: print(f"[IMAP] Searching with query: {query}")
+        if VERBOSE:
+            print(f"[IMAP] Searching with query: {query}")
         status, data = mail.search(None, query)
         if status != "OK":
             print(f"[DEBUG] Search failed for {addr} with status {status}")
@@ -126,12 +140,14 @@ def check_single_email_blocking(cfg):
 
         uids = data[0].split()
         if not uids or uids == [b""]:
-            if VERBOSE: print(f"[DEBUG] No matching emails for {addr}")
+            if VERBOSE:
+                print(f"[DEBUG] No matching emails for {addr}")
             mail.close()
             mail.logout()
             return
 
-        if VERBOSE: print(f"[IMAP] Found {len(uids)} message(s) for {addr}")
+        if VERBOSE:
+            print(f"[IMAP] Found {len(uids)} message(s) for {addr}")
 
         channel = None
         if cfg.get("channel_id"):
@@ -143,22 +159,35 @@ def check_single_email_blocking(cfg):
             uid = uid_b.decode()
             seen_set = seen_uids.setdefault(addr, set())
             if uid in seen_set:
-                if VERBOSE: print(f"[DEBUG] UID {uid} already processed for {addr}")
+                if VERBOSE:
+                    print(f"[DEBUG] UID {uid} already processed for {addr}")
                 continue
 
             # Fetch with BODY.PEEK[] to avoid marking read
-            if VERBOSE: print(f"[IMAP] Fetching UID {uid} (BODY.PEEK[])")
+            if VERBOSE:
+                print(f"[IMAP] Fetching UID {uid} (BODY.PEEK[])")
             try:
-                status, msg_data = mail.fetch(uid_b, "(BODY.PEEK[])")
+                status, msg_data = mail.fetch(uid_b, "(BODY.PEEK[] FLAGS)")
             except Exception as e:
                 print(f"[ERROR] fetch failed for {addr} uid {uid}: {e}")
                 continue
 
             if status != "OK" or not msg_data or not msg_data[0]:
-                if VERBOSE: print(f"[DEBUG] Empty fetch for uid {uid} ({status})")
+                if VERBOSE:
+                    print(f"[DEBUG] Empty fetch for uid {uid} ({status})")
                 continue
 
-            raw_email = msg_data[0][1]
+            # msg_data often contains tuples and a closing line; find the bytes payload
+            raw_email = None
+            for part in msg_data:
+                if isinstance(part, tuple) and part[1]:
+                    raw_email = part[1]
+                    break
+            if raw_email is None:
+                if VERBOSE:
+                    print(f"[DEBUG] No raw email bytes found for uid {uid}")
+                continue
+
             try:
                 msg = email.message_from_bytes(raw_email)
             except Exception as e:
@@ -166,6 +195,31 @@ def check_single_email_blocking(cfg):
                 seen_set.add(uid)
                 save_seen_uids()
                 continue
+
+            # If USE_READ_2H is set, verify the Date header is within last 2 hours
+            if USE_READ_2H:
+                date_hdr = msg.get("Date")
+                if date_hdr:
+                    try:
+                        dt = parsedate_to_datetime(date_hdr)
+                        # normalize to UTC-aware
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        age = datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
+                        if age > timedelta(hours=2):
+                            if VERBOSE:
+                                print(f"[DEBUG] UID {uid} Date {dt.isoformat()} older than 2 hours; skipping")
+                            # still mark as seen in our local seen map to avoid refetching
+                            seen_set.add(uid)
+                            save_seen_uids()
+                            continue
+                    except Exception as e:
+                        if VERBOSE:
+                            print(f"[WARN] Failed to parse Date header for uid {uid}: {e}")
+                        # fall through and attempt detection anyway
+                else:
+                    if VERBOSE:
+                        print(f"[WARN] No Date header for uid {uid}; proceeding without 2-hour filter")
 
             result, full_text = parse_email(msg, return_full_text=True)
 
@@ -190,7 +244,8 @@ def check_single_email_blocking(cfg):
                     with open("debug_email_dump.txt", "a", encoding="utf-8") as df:
                         dump = {"uid": uid, "from": msg.get("From"), "full_text": full_text}
                         df.write(json.dumps(dump) + "\n\n")
-                    if VERBOSE: print(f"[DEBUG] Dumped non-matching email uid {uid}")
+                    if VERBOSE:
+                        print(f"[DEBUG] Dumped non-matching email uid {uid}")
                 except Exception as e:
                     print(f"[ERROR] writing debug dump for uid {uid}: {e}")
 
@@ -240,7 +295,8 @@ def parse_email(msg, return_full_text=False):
                 except Exception:
                     body = payload.decode("utf-8", errors="ignore")
     except Exception as e:
-        if VERBOSE: print(f"[WARN] error extracting parts: {e}")
+        if VERBOSE:
+            print(f"[WARN] error extracting parts: {e}")
 
     if not body and html_parts:
         html = "\n".join(html_parts)
@@ -334,7 +390,6 @@ def extract_amount_and_sender(text, service):
             amount = float(amount_str)
             if amount <= 0:
                 continue
-            # normalize sender casing: Title case for uppercase bank names
             sender = (sender_candidate.title() if sender_candidate and sender_candidate.isupper() else (sender_candidate or extract_sender_info(text)))
             return amount, sender
         except (ValueError, TypeError):
@@ -343,7 +398,6 @@ def extract_amount_and_sender(text, service):
     return None, None
 
 def extract_sender_info(text):
-    # heuristics to find sender name or contact
     name_match = re.search(r'From[:\s]+([A-Za-z][A-Za-z\'\-\.\s]{1,120}?)', text, re.IGNORECASE)
     name = name_match.group(1).strip() if name_match else None
 
@@ -375,9 +429,7 @@ async def on_ready():
 atexit.register(save_seen_uids)
 
 if __name__ == "__main__":
-    # quick syntax sanity check (imported modules present)
     try:
-        # Start bot
         print("[DEBUG] Calling bot.run()")
         bot.run(TOKEN)
     except discord.LoginFailure:
