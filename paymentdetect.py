@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
 """
 paymentdetect.py
-Detect payments (Zelle, PayPal, Chime, Cash App, Venmo) and post to Discord.
-
-Behavior:
-- By default searches UNSEEN messages and posts only new UIDs (SHOW_ONLY_NEW=true).
-- USE_READ_2H=true enforces a strict "received in last 2 hours" filter using the IMAP INTERNALDATE (server timestamp).
-- USE_HOUR_WINDOW=true will use UNSEEN SINCE 1 hour as an alternate server-side narrowing (less precise).
-- Uses BODY.PEEK[] to avoid marking messages read.
-- Persists seen UIDs per account in seen_uids.json.
-- Dumps non-matching parsed emails to debug_email_dump.txt.
-- Optional verbose debug via VERBOSE_DEBUG env var.
-Environment: info.env loaded by python-dotenv with DISCORD_TOKEN and EMAIL_1_ADDRESS/_PASSWORD/_IMAP/_CHANNEL, etc.
+Fixed: strong startup logging, explicit token checks, detailed exception traces,
+INTERNALDATE 2-hour enforcement, SHOW_ONLY_NEW behavior, and safer fetch/parse flow.
+Drop this over your current file, restart with `python paymentdetect.py`, and watch console output.
 """
 import os
 import re
@@ -23,6 +15,7 @@ import threading
 import time
 import json
 import atexit
+import traceback
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
@@ -30,7 +23,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-print("[BOOT] paymentdetect.py is running")
+print("[BOOT] starting paymentdetect.py")
 
 # Load env
 load_dotenv("info.env")
@@ -41,7 +34,7 @@ SHOW_ONLY_NEW = os.getenv("SHOW_ONLY_NEW", "true").lower() in ("1", "true", "yes
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
-    print("[ERROR] DISCORD_TOKEN not found in environment")
+    print("[ERROR] DISCORD_TOKEN not found in environment - please set DISCORD_TOKEN in info.env")
 
 # Load email account configs EMAIL_1_..., EMAIL_2_...
 email_configs = []
@@ -60,7 +53,7 @@ while True:
 
 print(f"[DEBUG] Loaded {len(email_configs)} email config(s)")
 if not email_configs:
-    raise SystemExit("No email configs found in info.env")
+    print("[ERROR] No email configs found in info.env (EMAIL_1_ADDRESS etc.)")
 
 # Discord setup
 intents = discord.Intents.default()
@@ -77,6 +70,7 @@ def load_seen_uids():
                 return {k: set(v) for k, v in raw.items()}
         except Exception as e:
             print(f"[WARN] Failed to load seen_uids.json: {e}")
+            traceback.print_exc()
     return {cfg["address"]: set() for cfg in email_configs}
 
 def save_seen_uids():
@@ -85,14 +79,11 @@ def save_seen_uids():
             json.dump({k: list(v) for k, v in seen_uids.items()}, f)
     except Exception as e:
         print(f"[ERROR] Failed to save seen_uids.json: {e}")
+        traceback.print_exc()
 
 seen_uids = load_seen_uids()
 
 def get_search_query():
-    """
-    Return an IMAP search query string.
-    Note: SINCE may be day-granular on some IMAP servers; USE_READ_2H enforces exact 2-hour filtering locally via INTERNALDATE.
-    """
     if USE_READ_2H:
         since_date = (datetime.now() - timedelta(hours=2)).strftime("%d-%b-%Y")
         return f'(SEEN SINCE "{since_date}")'
@@ -109,28 +100,42 @@ def email_check_loop():
             for cfg in email_configs:
                 check_single_email_blocking(cfg)
         except Exception as e:
-            print(f"[ERROR] email_check_loop: {e}")
+            print(f"[ERROR] email_check_loop exception: {e}")
+            traceback.print_exc()
         time.sleep(30)
 
 def check_single_email_blocking(cfg):
     addr = cfg["address"]
+    if VERBOSE:
+        print(f"[IMAP] Starting check for {addr}")
     try:
-        if VERBOSE:
-            print(f"[IMAP] Connecting to {cfg['imap']} for {addr}")
         mail = imaplib.IMAP4_SSL(cfg["imap"], timeout=30)
+    except Exception as e:
+        print(f"[ERROR] Could not connect to IMAP host {cfg.get('imap')} for {addr}: {e}")
+        traceback.print_exc()
+        return
+
+    try:
         mail.login(addr, cfg["password"])
         mail.select("inbox")
     except Exception as e:
         print(f"[ERROR] IMAP login/select for {addr}: {e}")
+        traceback.print_exc()
+        try:
+            mail.logout()
+        except Exception:
+            pass
         return
 
     try:
         query = get_search_query()
         if VERBOSE:
-            print(f"[IMAP] Searching with query: {query}")
+            print(f"[IMAP] Searching {addr} with query: {query}")
         status, data = mail.search(None, query)
         if status != "OK":
             print(f"[DEBUG] Search failed for {addr} with status {status}")
+            if VERBOSE:
+                print("Search raw data:", data)
             mail.close()
             mail.logout()
             return
@@ -144,7 +149,7 @@ def check_single_email_blocking(cfg):
             return
 
         if VERBOSE:
-            print(f"[IMAP] Found {len(uids)} message(s) for {addr}")
+            print(f"[IMAP] Found {len(uids)} candidate message(s) for {addr}")
 
         channel = None
         if cfg.get("channel_id"):
@@ -162,13 +167,13 @@ def check_single_email_blocking(cfg):
                     print(f"[DEBUG] Skipping already-seen UID {uid} for {addr}")
                 continue
 
-            # Fetch BODY.PEEK[] and INTERNALDATE for reliable server timestamp
             if VERBOSE:
-                print(f"[IMAP] Fetching UID {uid} (BODY.PEEK[] INTERNALDATE)")
+                print(f"[IMAP] Fetching UID {uid} (BODY.PEEK[] INTERNALDATE) for {addr}")
             try:
                 status, msg_data = mail.fetch(uid_b, '(BODY.PEEK[] INTERNALDATE)')
             except Exception as e:
                 print(f"[ERROR] fetch failed for {addr} uid {uid}: {e}")
+                traceback.print_exc()
                 continue
 
             if status != "OK" or not msg_data:
@@ -176,23 +181,18 @@ def check_single_email_blocking(cfg):
                     print(f"[DEBUG] Empty fetch for uid {uid} ({status})")
                 continue
 
-            # Extract raw email bytes and INTERNALDATE token
             raw_email = None
             internaldate_raw = None
-            # msg_data commonly contains tuples and other items; inspect all
             for part in msg_data:
                 if isinstance(part, tuple) and part[1]:
-                    # part[1] is the raw bytes of the message when present
-                    # prefer the largest bytes blob if multiple are present
                     if raw_email is None or (isinstance(part[1], (bytes, bytearray)) and len(part[1]) > len(raw_email)):
                         raw_email = part[1]
-                # other parts may be bytes containing the metadata line with INTERNALDATE
                 if isinstance(part, bytes):
                     m = re.search(rb'INTERNALDATE\s+"([^"]+)"', part)
                     if m:
                         internaldate_raw = m.group(1).decode(errors='ignore')
 
-            # fallback: attempt to extract INTERNALDATE from first element header bytes if present
+            # fallback search
             if internaldate_raw is None and isinstance(msg_data[0], tuple) and isinstance(msg_data[0][0], bytes):
                 m = re.search(rb'INTERNALDATE\s+"([^"]+)"', msg_data[0][0])
                 if m:
@@ -203,11 +203,11 @@ def check_single_email_blocking(cfg):
                     print(f"[DEBUG] No raw email bytes found for uid {uid}")
                 continue
 
-            # If USE_READ_2H enforce 2-hour cutoff using INTERNALDATE (server timestamp)
+            # Use INTERNALDATE for reliable server arrival time when USE_READ_2H set
             if USE_READ_2H:
                 if not internaldate_raw:
                     if VERBOSE:
-                        print(f"[WARN] No INTERNALDATE for uid {uid}; skipping in 2-hour mode")
+                        print(f"[WARN] No INTERNALDATE for uid {uid}; marking seen and skipping in 2-hour mode")
                     seen_set.add(uid); save_seen_uids()
                     continue
                 try:
@@ -217,33 +217,33 @@ def check_single_email_blocking(cfg):
                     age = datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
                     if age > timedelta(hours=2):
                         if VERBOSE:
-                            print(f"[DEBUG] UID {uid} INTERNALDATE {dt.isoformat()} older than 2 hours; skipping")
+                            print(f"[DEBUG] UID {uid} INTERNALDATE {dt.isoformat()} older than 2 hours; marking seen and skipping")
                         seen_set.add(uid); save_seen_uids()
                         continue
                 except Exception as e:
                     if VERBOSE:
                         print(f"[WARN] Failed to parse INTERNALDATE for uid {uid}: {e}")
+                        traceback.print_exc()
                     seen_set.add(uid); save_seen_uids()
                     continue
 
-            # Parse the email object
+            # parse email object
             try:
                 msg = email.message_from_bytes(raw_email)
             except Exception as e:
                 print(f"[ERROR] parsing email bytes uid {uid}: {e}")
+                traceback.print_exc()
                 seen_set.add(uid); save_seen_uids()
                 continue
 
-            # Parse and detect payment
             result, full_text = parse_email(msg, return_full_text=True)
 
             if result:
-                # final guard: post only if SHOW_ONLY_NEW logic allows it
                 if SHOW_ONLY_NEW and uid in seen_set:
                     if VERBOSE:
                         print(f"[DEBUG] UID {uid} added during processing; skipping post")
                 else:
-                    print(f"[SUCCESS] ${result['amount']} from {result['sender']} via {result['service']}")
+                    print(f"[SUCCESS] {result['service']} ${result['amount']} from {result['sender']} (uid {uid})")
                     if channel:
                         embed = discord.Embed(
                             title=f"New {result['service']} Payment!",
@@ -257,8 +257,8 @@ def check_single_email_blocking(cfg):
                             asyncio.run_coroutine_threadsafe(channel.send(embed=embed), bot.loop)
                         except Exception as e:
                             print(f"[ERROR] sending to discord channel {cfg.get('channel_id')}: {e}")
+                            traceback.print_exc()
             else:
-                # dump non-matching full_text for inspection
                 try:
                     with open("debug_email_dump.txt", "a", encoding="utf-8") as df:
                         dump = {"uid": uid, "from": msg.get("From"), "full_text": full_text}
@@ -267,8 +267,9 @@ def check_single_email_blocking(cfg):
                         print(f"[DEBUG] Dumped non-matching email uid {uid}")
                 except Exception as e:
                     print(f"[ERROR] writing debug dump for uid {uid}: {e}")
+                    traceback.print_exc()
 
-            # persist UID so we don't re-post later
+            # persist UID to avoid reposting
             seen_set.add(uid)
             save_seen_uids()
 
@@ -280,12 +281,10 @@ def check_single_email_blocking(cfg):
             pass
 
 def parse_email(msg, return_full_text=False):
-    # decode subject header safely
     subject_header = msg.get("Subject", "") or ""
     decoded = decode_header(subject_header)[0][0]
     subject = decoded.decode(errors="ignore") if isinstance(decoded, bytes) else (decoded or "")
 
-    # extract text body: prefer text/plain, else join html parts and convert
     body = ""
     html_parts = []
     try:
@@ -316,6 +315,7 @@ def parse_email(msg, return_full_text=False):
     except Exception as e:
         if VERBOSE:
             print(f"[WARN] error extracting parts: {e}")
+            traceback.print_exc()
 
     if not body and html_parts:
         html = "\n".join(html_parts)
@@ -325,7 +325,6 @@ def parse_email(msg, return_full_text=False):
     from_addr = (email.utils.parseaddr(msg.get("From", ""))[1] or "").lower()
     from_name = (email.utils.parseaddr(msg.get("From", ""))[0] or "").strip()
 
-    # service detection
     service = None
     ft_lower = full_text.lower()
     if "zelle" in from_addr or "zelle" in ft_lower:
@@ -339,7 +338,6 @@ def parse_email(msg, return_full_text=False):
     elif "venmo" in from_addr or "venmo.com" in from_addr or "venmo" in ft_lower:
         service = "Venmo"
     else:
-        # Zelle heuristics for bank notifications
         if re.search(r"good news[:\s].*zelle", full_text, re.IGNORECASE) or \
            re.search(r"has just sent you money.*zelle", full_text, re.IGNORECASE) or \
            re.search(r"\bSENT YOU MONEY\b", full_text, re.IGNORECASE) or \
@@ -353,12 +351,7 @@ def parse_email(msg, return_full_text=False):
     if amount is None:
         return (None, full_text) if return_full_text else None
 
-    result = {
-        "service": service,
-        "amount": amount,
-        "sender": sender,
-        "subject": subject or ""
-    }
+    result = {"service": service, "amount": amount, "sender": sender, "subject": subject or ""}
     return (result, full_text) if return_full_text else result
 
 def extract_amount_and_sender(text, service):
@@ -377,15 +370,9 @@ def extract_amount_and_sender(text, service):
             r'You received \$?([\d,]+(?:\.\d{1,2})?)',
             r'Payment received[:\s]+\$?([\d,]+(?:\.\d{1,2})?)'
         ],
-        "Chime": [
-            r'You just got paid \$?([\d,]+(?:\.\d{1,2})?)'
-        ],
-        "Cash App": [
-            r'Cash App.+?\$?([\d,]+(?:\.\d{1,2})?)'
-        ],
-        "Venmo": [
-            r'paid you \$?([\d,]+(?:\.\d{1,2})?)'
-        ]
+        "Chime": [r'You just got paid \$?([\d,]+(?:\.\d{1,2})?)'],
+        "Cash App": [r'Cash App.+?\$?([\d,]+(?:\.\d{1,2})?)'],
+        "Venmo": [r'paid you \$?([\d,]+(?:\.\d{1,2})?)']
     }
 
     for pattern in patterns.get(service, []):
@@ -393,7 +380,6 @@ def extract_amount_and_sender(text, service):
         if not match:
             continue
 
-        # If two groups captured (name + amount)
         if service in ("Zelle", "PayPal") and len(match.groups()) >= 2:
             sender_candidate = match.group(1).strip()
             amount_candidate = match.group(2)
@@ -439,19 +425,21 @@ def extract_sender_info(text):
 
 @bot.event
 async def on_ready():
-    print(f"[DEBUG] Logged in as: {bot.user}")
+    print(f"[DEBUG] Logged in as: {bot.user} (id: {getattr(bot.user,'id',None)})")
     print("[DEBUG] Starting email polling thread...")
     thread = threading.Thread(target=email_check_loop, daemon=True)
     thread.start()
 
-# Ensure seen UID save on exit
 atexit.register(save_seen_uids)
 
 if __name__ == "__main__":
+    print("[DEBUG] Entering main; checking token presence and starting bot")
+    if not TOKEN:
+        print("[FATAL] Missing DISCORD_TOKEN. Exiting.")
+        raise SystemExit(1)
     try:
-        print("[DEBUG] Calling bot.run()")
         bot.run(TOKEN)
-    except discord.LoginFailure:
-        print("[ERROR] Invalid Discord token")
     except Exception as e:
-        print(f"[ERROR] Unexpected runtime error: {e}")
+        print("[FATAL] bot.run() raised an exception:", type(e).__name__, str(e))
+        traceback.print_exc()
+        raise
