@@ -2,13 +2,12 @@
 """
 paymentdetect.py
 Full script with:
-- verbose startup logs
+- always-running polling loop (Option B)
 - reliable INTERNALDATE 2-hour filter (USE_READ_2H)
 - SHOW_ONLY_NEW enforcement
 - robust fetch using BODY.PEEK[] INTERNALDATE
 - explicit on_ready diagnostics and guaranteed email polling thread start
-- helpful debug flags via info.env:
-  VERBOSE_DEBUG, USE_HOUR_WINDOW, USE_READ_2H, SHOW_ONLY_NEW
+Debug flags via info.env: VERBOSE_DEBUG, USE_HOUR_WINDOW, USE_READ_2H, SHOW_ONLY_NEW
 Environment: info.env loaded by python-dotenv with DISCORD_TOKEN and EMAIL_1_ADDRESS/_PASSWORD/_IMAP/_CHANNEL.
 """
 import os
@@ -99,21 +98,193 @@ def get_search_query():
     return "UNSEEN"
 
 def email_check_loop():
+    # run_cycle does the per-account check and prints verbose info when VERBOSE is True
+    def run_cycle():
+        now = datetime.now().isoformat()
+        print(f"[CYCLE] Checking {len(email_configs)} accounts at {now}")
+        for cfg in email_configs:
+            addr = cfg["address"]
+            print(f"[CYCLE] -> account {addr}")
+            try:
+                mail = imaplib.IMAP4_SSL(cfg["imap"], timeout=30)
+            except Exception as e:
+                print(f"[IMAP][{addr}] CONNECT FAILED: {e}")
+                continue
+            try:
+                mail.login(addr, cfg["password"])
+                print(f"[IMAP][{addr}] LOGIN OK")
+                mail.select("inbox")
+            except Exception as e:
+                print(f"[IMAP][{addr}] LOGIN/SELECT FAILED: {e}")
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
+                continue
+
+            try:
+                query = get_search_query()
+                print(f"[IMAP][{addr}] Searching with: {query}")
+                status, data = mail.search(None, query)
+                print(f"[IMAP][{addr}] Search status: {status}")
+                if status != "OK":
+                    print(f"[IMAP][{addr}] Search raw: {data}")
+                    mail.close(); mail.logout(); continue
+                uids = data[0].split()
+                print(f"[IMAP][{addr}] Found {len(uids)} uids")
+            except Exception as e:
+                print(f"[IMAP][{addr}] SEARCH FAILED: {e}")
+                traceback.print_exc()
+                try:
+                    mail.close(); mail.logout()
+                except Exception:
+                    pass
+                continue
+
+            # show a few candidate UIDs
+            for uid_b in uids[:5]:
+                uid = uid_b.decode()
+                print(f"[IMAP][{addr}] Candidate UID: {uid} (seen_in_map={uid in seen_uids.get(addr, set())})")
+
+            # process candidates normally (reuse existing logic for each uid)
+            for uid_b in uids:
+                uid = uid_b.decode()
+                seen_set = seen_uids.setdefault(addr, set())
+                if SHOW_ONLY_NEW and uid in seen_set:
+                    if VERBOSE:
+                        print(f"[DEBUG] Skipping already-seen UID {uid} for {addr}")
+                    continue
+
+                if VERBOSE:
+                    print(f"[IMAP][{addr}] Fetching UID {uid} (BODY.PEEK[] INTERNALDATE)")
+                try:
+                    status, msg_data = mail.fetch(uid_b, '(BODY.PEEK[] INTERNALDATE)')
+                except Exception as e:
+                    print(f"[ERROR] fetch failed for {addr} uid {uid}: {e}")
+                    traceback.print_exc()
+                    continue
+
+                if status != "OK" or not msg_data:
+                    if VERBOSE:
+                        print(f"[DEBUG] Empty fetch for uid {uid} ({status})")
+                    continue
+
+                raw_email = None
+                internaldate_raw = None
+                for part in msg_data:
+                    if isinstance(part, tuple) and part[1]:
+                        if raw_email is None or (isinstance(part[1], (bytes, bytearray)) and len(part[1]) > len(raw_email)):
+                            raw_email = part[1]
+                    if isinstance(part, bytes):
+                        m = re.search(rb'INTERNALDATE\s+"([^"]+)"', part)
+                        if m:
+                            internaldate_raw = m.group(1).decode(errors='ignore')
+
+                if internaldate_raw is None and isinstance(msg_data[0], tuple) and isinstance(msg_data[0][0], bytes):
+                    m = re.search(rb'INTERNALDATE\s+"([^"]+)"', msg_data[0][0])
+                    if m:
+                        internaldate_raw = m.group(1).decode(errors='ignore')
+
+                if raw_email is None:
+                    if VERBOSE:
+                        print(f"[DEBUG] No raw email bytes found for uid {uid}")
+                    continue
+
+                # enforce 2-hour window using INTERNALDATE if enabled
+                if USE_READ_2H:
+                    if not internaldate_raw:
+                        if VERBOSE:
+                            print(f"[WARN] No INTERNALDATE for uid {uid}; marking seen and skipping in 2-hour mode")
+                        seen_set.add(uid); save_seen_uids()
+                        continue
+                    try:
+                        dt = parsedate_to_datetime(internaldate_raw)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        age = datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
+                        if age > timedelta(hours=2):
+                            if VERBOSE:
+                                print(f"[DEBUG] UID {uid} INTERNALDATE {dt.isoformat()} older than 2 hours; marking seen and skipping")
+                            seen_set.add(uid); save_seen_uids()
+                            continue
+                    except Exception as e:
+                        if VERBOSE:
+                            print(f"[WARN] Failed to parse INTERNALDATE for uid {uid}: {e}")
+                            traceback.print_exc()
+                        seen_set.add(uid); save_seen_uids()
+                        continue
+
+                try:
+                    msg = email.message_from_bytes(raw_email)
+                except Exception as e:
+                    print(f"[ERROR] parsing email bytes uid {uid}: {e}")
+                    traceback.print_exc()
+                    seen_set.add(uid); save_seen_uids()
+                    continue
+
+                result, full_text = parse_email(msg, return_full_text=True)
+                channel = None
+                # resolve channel once (use bot cache; if None it's OK, posts will be skipped)
+                cfg_channel_id = cfg.get("channel_id")
+                if cfg_channel_id:
+                    channel = bot.get_channel(cfg_channel_id)
+
+                if result:
+                    if SHOW_ONLY_NEW and uid in seen_set:
+                        if VERBOSE:
+                            print(f"[DEBUG] UID {uid} added during processing; skipping post")
+                    else:
+                        print(f"[SUCCESS] {result['service']} ${result['amount']} from {result['sender']} (uid {uid})")
+                        if channel:
+                            embed = discord.Embed(
+                                title=f"New {result['service']} Payment!",
+                                description=f"**Account:** `{addr}`",
+                                color=0x00FF00
+                            )
+                            embed.add_field(name="Amount", value=f"${result['amount']:,.2f}", inline=True)
+                            embed.add_field(name="From", value=result['sender'], inline=True)
+                            embed.set_footer(text=f"Subject: {result['subject'][:100]}")
+                            try:
+                                asyncio.run_coroutine_threadsafe(channel.send(embed=embed), bot.loop)
+                            except Exception as e:
+                                print(f"[ERROR] sending to discord channel {cfg.get('channel_id')}: {e}")
+                                traceback.print_exc()
+                else:
+                    try:
+                        with open("debug_email_dump.txt", "a", encoding="utf-8") as df:
+                            dump = {"uid": uid, "from": msg.get("From"), "full_text": full_text}
+                            df.write(json.dumps(dump) + "\n\n")
+                        if VERBOSE:
+                            print(f"[DEBUG] Dumped non-matching email uid {uid}")
+                    except Exception as e:
+                        print(f"[ERROR] writing debug dump for uid {uid}: {e}")
+                        traceback.print_exc()
+
+                seen_set.add(uid)
+                save_seen_uids()
+
+            try:
+                mail.close(); mail.logout()
+            except Exception:
+                pass
+
+    # Immediate first run (always)
+    run_cycle()
+
+    # Normal background loop: ALWAYS run a cycle every 30 seconds
     while True:
         try:
-            if VERBOSE:
-                print(f"[CYCLE] Checking {len(email_configs)} accounts at {datetime.now().isoformat()}")
-            for cfg in email_configs:
-                check_single_email_blocking(cfg)
+            run_cycle()
         except Exception as e:
             print(f"[ERROR] email_check_loop exception: {e}")
             traceback.print_exc()
         time.sleep(30)
 
 def check_single_email_blocking(cfg):
+    # kept for compatibility; not used by new loop but harmless fallback
     addr = cfg["address"]
     if VERBOSE:
-        print(f"[IMAP] Starting check for {addr}")
+        print(f"[IMAP] Starting single check for {addr}")
     try:
         mail = imaplib.IMAP4_SSL(cfg["imap"], timeout=30)
     except Exception as e:
@@ -139,150 +310,15 @@ def check_single_email_blocking(cfg):
             print(f"[IMAP] Searching {addr} with query: {query}")
         status, data = mail.search(None, query)
         if status != "OK":
-            print(f"[DEBUG] Search failed for {addr} with status {status}")
             if VERBOSE:
-                print("Search raw data:", data)
-            mail.close()
-            mail.logout()
-            return
-
+                print(f"[DEBUG] Search failed for {addr} with status {status}; raw: {data}")
+            mail.close(); mail.logout(); return
         uids = data[0].split()
-        if not uids or uids == [b""]:
-            if VERBOSE:
-                print(f"[DEBUG] No matching emails for {addr}")
-            mail.close()
-            mail.logout()
-            return
-
         if VERBOSE:
             print(f"[IMAP] Found {len(uids)} candidate message(s) for {addr}")
-
-        channel = None
-        if cfg.get("channel_id"):
-            channel = bot.get_channel(cfg["channel_id"])
-            if channel is None and VERBOSE:
-                print(f"[WARN] Discord channel {cfg['channel_id']} not available to bot")
-
-        for uid_b in uids:
-            uid = uid_b.decode()
-            seen_set = seen_uids.setdefault(addr, set())
-
-            # Skip already-seen if configured
-            if SHOW_ONLY_NEW and uid in seen_set:
-                if VERBOSE:
-                    print(f"[DEBUG] Skipping already-seen UID {uid} for {addr}")
-                continue
-
-            if VERBOSE:
-                print(f"[IMAP] Fetching UID {uid} (BODY.PEEK[] INTERNALDATE) for {addr}")
-            try:
-                status, msg_data = mail.fetch(uid_b, '(BODY.PEEK[] INTERNALDATE)')
-            except Exception as e:
-                print(f"[ERROR] fetch failed for {addr} uid {uid}: {e}")
-                traceback.print_exc()
-                continue
-
-            if status != "OK" or not msg_data:
-                if VERBOSE:
-                    print(f"[DEBUG] Empty fetch for uid {uid} ({status})")
-                continue
-
-            raw_email = None
-            internaldate_raw = None
-            for part in msg_data:
-                if isinstance(part, tuple) and part[1]:
-                    if raw_email is None or (isinstance(part[1], (bytes, bytearray)) and len(part[1]) > len(raw_email)):
-                        raw_email = part[1]
-                if isinstance(part, bytes):
-                    m = re.search(rb'INTERNALDATE\s+"([^"]+)"', part)
-                    if m:
-                        internaldate_raw = m.group(1).decode(errors='ignore')
-
-            # fallback search
-            if internaldate_raw is None and isinstance(msg_data[0], tuple) and isinstance(msg_data[0][0], bytes):
-                m = re.search(rb'INTERNALDATE\s+"([^"]+)"', msg_data[0][0])
-                if m:
-                    internaldate_raw = m.group(1).decode(errors='ignore')
-
-            if raw_email is None:
-                if VERBOSE:
-                    print(f"[DEBUG] No raw email bytes found for uid {uid}")
-                continue
-
-            # Use INTERNALDATE for reliable server arrival time when USE_READ_2H set
-            if USE_READ_2H:
-                if not internaldate_raw:
-                    if VERBOSE:
-                        print(f"[WARN] No INTERNALDATE for uid {uid}; marking seen and skipping in 2-hour mode")
-                    seen_set.add(uid); save_seen_uids()
-                    continue
-                try:
-                    dt = parsedate_to_datetime(internaldate_raw)
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    age = datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
-                    if age > timedelta(hours=2):
-                        if VERBOSE:
-                            print(f"[DEBUG] UID {uid} INTERNALDATE {dt.isoformat()} older than 2 hours; marking seen and skipping")
-                        seen_set.add(uid); save_seen_uids()
-                        continue
-                except Exception as e:
-                    if VERBOSE:
-                        print(f"[WARN] Failed to parse INTERNALDATE for uid {uid}: {e}")
-                        traceback.print_exc()
-                    seen_set.add(uid); save_seen_uids()
-                    continue
-
-            # parse email object
-            try:
-                msg = email.message_from_bytes(raw_email)
-            except Exception as e:
-                print(f"[ERROR] parsing email bytes uid {uid}: {e}")
-                traceback.print_exc()
-                seen_set.add(uid); save_seen_uids()
-                continue
-
-            result, full_text = parse_email(msg, return_full_text=True)
-
-            if result:
-                if SHOW_ONLY_NEW and uid in seen_set:
-                    if VERBOSE:
-                        print(f"[DEBUG] UID {uid} added during processing; skipping post")
-                else:
-                    print(f"[SUCCESS] {result['service']} ${result['amount']} from {result['sender']} (uid {uid})")
-                    if channel:
-                        embed = discord.Embed(
-                            title=f"New {result['service']} Payment!",
-                            description=f"**Account:** `{addr}`",
-                            color=0x00FF00
-                        )
-                        embed.add_field(name="Amount", value=f"${result['amount']:,.2f}", inline=True)
-                        embed.add_field(name="From", value=result['sender'], inline=True)
-                        embed.set_footer(text=f"Subject: {result['subject'][:100]}")
-                        try:
-                            asyncio.run_coroutine_threadsafe(channel.send(embed=embed), bot.loop)
-                        except Exception as e:
-                            print(f"[ERROR] sending to discord channel {cfg.get('channel_id')}: {e}")
-                            traceback.print_exc()
-            else:
-                try:
-                    with open("debug_email_dump.txt", "a", encoding="utf-8") as df:
-                        dump = {"uid": uid, "from": msg.get("From"), "full_text": full_text}
-                        df.write(json.dumps(dump) + "\n\n")
-                    if VERBOSE:
-                        print(f"[DEBUG] Dumped non-matching email uid {uid}")
-                except Exception as e:
-                    print(f"[ERROR] writing debug dump for uid {uid}: {e}")
-                    traceback.print_exc()
-
-            # persist UID to avoid reposting
-            seen_set.add(uid)
-            save_seen_uids()
-
     finally:
         try:
-            mail.close()
-            mail.logout()
+            mail.close(); mail.logout()
         except Exception:
             pass
 
@@ -449,9 +485,6 @@ async def on_ready():
     if not getattr(bot, "_email_thread_started", False):
         start_thread()
         bot._email_thread_started = True
-    # Optional immediate synchronous check for debugging (commented out by default)
-    # print("[DEBUG] Running immediate first email check (debug-only)")
-    # email_check_loop()
 
 atexit.register(save_seen_uids)
 
