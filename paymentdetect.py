@@ -2,10 +2,11 @@
 """
 paymentdetect.py
 Full script with:
-- always-running polling loop (Option B)
+- always-running polling loop
 - reliable INTERNALDATE 2-hour filter (USE_READ_2H)
 - SHOW_ONLY_NEW enforcement
 - robust fetch using BODY.PEEK[] INTERNALDATE
+- fixed get_search_query to avoid future-date SINCE values
 - explicit on_ready diagnostics and guaranteed email polling thread start
 Debug flags via info.env: VERBOSE_DEBUG, USE_HOUR_WINDOW, USE_READ_2H, SHOW_ONLY_NEW
 Environment: info.env loaded by python-dotenv with DISCORD_TOKEN and EMAIL_1_ADDRESS/_PASSWORD/_IMAP/_CHANNEL.
@@ -89,11 +90,38 @@ def save_seen_uids():
 seen_uids = load_seen_uids()
 
 def get_search_query():
+    """
+    Build an IMAP search clause safely. Compute an aware UTC timestamp,
+    convert to local date and clamp to today to avoid future dates.
+
+    USE_READ_2H  -> (SEEN SINCE "dd-Mon-YYYY")
+    USE_HOUR_WINDOW -> (UNSEEN SINCE "dd-Mon-YYYY")
+    otherwise -> "UNSEEN"
+    """
+    # compute reference times in UTC then convert to local date
+    now_utc = datetime.now(timezone.utc)
     if USE_READ_2H:
-        since_date = (datetime.now() - timedelta(hours=2)).strftime("%d-%b-%Y")
+        ref = now_utc - timedelta(hours=2)
+    elif USE_HOUR_WINDOW:
+        ref = now_utc - timedelta(hours=1)
+    else:
+        # UNSEEN mode doesn't need SINCE
+        return "UNSEEN"
+
+    # convert to local timezone date
+    local_date = ref.astimezone().date()
+    today_local = datetime.now().astimezone().date()
+    # safety clamp: never return a date in the future
+    if local_date > today_local:
+        local_date = today_local
+
+    since_date = local_date.strftime("%d-%b-%Y")
+    if VERBOSE:
+        print(f"[DEBUG] get_search_query computed since_date={since_date} (USE_READ_2H={USE_READ_2H}, USE_HOUR_WINDOW={USE_HOUR_WINDOW})")
+
+    if USE_READ_2H:
         return f'(SEEN SINCE "{since_date}")'
     if USE_HOUR_WINDOW:
-        since_date = (datetime.now() - timedelta(hours=1)).strftime("%d-%b-%Y")
         return f'(UNSEEN SINCE "{since_date}")'
     return "UNSEEN"
 
@@ -146,7 +174,7 @@ def email_check_loop():
                 uid = uid_b.decode()
                 print(f"[IMAP][{addr}] Candidate UID: {uid} (seen_in_map={uid in seen_uids.get(addr, set())})")
 
-            # process candidates normally (reuse existing logic for each uid)
+            # process candidates
             for uid_b in uids:
                 uid = uid_b.decode()
                 seen_set = seen_uids.setdefault(addr, set())
@@ -224,7 +252,6 @@ def email_check_loop():
 
                 result, full_text = parse_email(msg, return_full_text=True)
                 channel = None
-                # resolve channel once (use bot cache; if None it's OK, posts will be skipped)
                 cfg_channel_id = cfg.get("channel_id")
                 if cfg_channel_id:
                     channel = bot.get_channel(cfg_channel_id)
