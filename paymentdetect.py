@@ -4,6 +4,7 @@ paymentdetect.py
 - Always-running polling loop
 - Enforce 2-hour window using IMAP INTERNALDATE at fetch time
 - Server-side search uses UNSEEN to avoid date-granularity/timezone issues
+- Limits work per cycle (MAX_PER_CYCLE) to avoid huge backlogs
 - SHOW_ONLY_NEW enforcement and UID persistence
 - Debug flags via info.env: VERBOSE_DEBUG, USE_READ_2H, SHOW_ONLY_NEW
 Environment: info.env loaded by python-dotenv with DISCORD_TOKEN and EMAIL_1_ADDRESS/_PASSWORD/_IMAP/_CHANNEL.
@@ -33,6 +34,8 @@ load_dotenv("info.env")
 VERBOSE = os.getenv("VERBOSE_DEBUG", "false").lower() in ("1", "true", "yes")
 USE_READ_2H = os.getenv("USE_READ_2H", "true").lower() in ("1", "true", "yes")
 SHOW_ONLY_NEW = os.getenv("SHOW_ONLY_NEW", "true").lower() in ("1", "true", "yes")
+# limit processed UIDs per cycle to avoid huge backlogs; adjust as needed
+MAX_PER_CYCLE = int(os.getenv("MAX_PER_CYCLE", "500"))
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
@@ -110,6 +113,7 @@ def email_check_loop():
                 mail.select("inbox")
             except Exception as e:
                 print(f"[IMAP][{addr}] LOGIN/SELECT FAILED: {e}")
+                traceback.print_exc()
                 try:
                     mail.logout()
                 except Exception:
@@ -123,8 +127,12 @@ def email_check_loop():
                 print(f"[IMAP][{addr}] Search status: {status}")
                 if status != "OK":
                     print(f"[IMAP][{addr}] Search raw: {data}")
-                    mail.close(); mail.logout(); continue
-                uids = data[0].split()
+                    try:
+                        mail.close(); mail.logout()
+                    except Exception:
+                        pass
+                    continue
+                uids = data[0].split() if data and data[0] else []
                 print(f"[IMAP][{addr}] Found {len(uids)} uids")
             except Exception as e:
                 print(f"[IMAP][{addr}] SEARCH FAILED: {e}")
@@ -135,7 +143,13 @@ def email_check_loop():
                     pass
                 continue
 
-            # show a few candidate UIDs
+            # If there are many uids, process newest MAX_PER_CYCLE only
+            if len(uids) > MAX_PER_CYCLE:
+                if VERBOSE:
+                    print(f"[IMAP][{addr}] Truncating {len(uids)} -> processing newest {MAX_PER_CYCLE} uids this cycle")
+                uids = uids[-MAX_PER_CYCLE:]
+
+            # show a few candidate UIDs for visibility
             for uid_b in uids[:5]:
                 uid = uid_b.decode()
                 print(f"[IMAP][{addr}] Candidate UID: {uid} (seen_in_map={uid in seen_uids.get(addr, set())})")
@@ -174,6 +188,7 @@ def email_check_loop():
                         if m:
                             internaldate_raw = m.group(1).decode(errors='ignore')
 
+                # fallback extraction
                 if internaldate_raw is None and isinstance(msg_data[0], tuple) and isinstance(msg_data[0][0], bytes):
                     m = re.search(rb'INTERNALDATE\s+"([^"]+)"', msg_data[0][0])
                     if m:
@@ -184,7 +199,18 @@ def email_check_loop():
                         print(f"[DEBUG] No raw email bytes found for uid {uid}")
                     continue
 
-                # enforce 2-hour window using INTERNALDATE if enabled
+                # --- DEBUG: show INTERNALDATE and age so you can confirm 2-hour filtering ---
+                if internaldate_raw:
+                    try:
+                        dt_dbg = parsedate_to_datetime(internaldate_raw)
+                        if dt_dbg.tzinfo is None:
+                            dt_dbg = dt_dbg.replace(tzinfo=timezone.utc)
+                        age_dbg = datetime.now(timezone.utc) - dt_dbg.astimezone(timezone.utc)
+                        print(f"[DEBUG] UID {uid} INTERNALDATE={internaldate_raw} parsed={dt_dbg.isoformat()} age={age_dbg}")
+                    except Exception as e:
+                        print(f"[WARN] Could not parse INTERNALDATE for uid {uid}: {e}")
+
+                # enforce 2-hour cutoff using INTERNALDATE if enabled
                 if USE_READ_2H:
                     if not internaldate_raw:
                         if VERBOSE:
@@ -198,7 +224,7 @@ def email_check_loop():
                         age = datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
                         if age > timedelta(hours=2):
                             if VERBOSE:
-                                print(f"[DEBUG] UID {uid} INTERNALDATE {dt.isoformat()} older than 2 hours; marking seen and skipping")
+                                print(f"[DEBUG] UID {uid} is older than 2 hours ({age}); marking seen and skipping")
                             seen_set.add(uid); save_seen_uids()
                             continue
                     except Exception as e:
@@ -216,7 +242,8 @@ def email_check_loop():
                     seen_set.add(uid); save_seen_uids()
                     continue
 
-                result, full_text = parse_email(msg, return_full_text=True)
+                result, full_text = parse_email(msg, return_full_text=True) if 'parse_email' in globals() else (None, "")
+                # resolve channel once
                 cfg_channel_id = cfg.get("channel_id")
                 channel = bot.get_channel(cfg_channel_id) if cfg_channel_id else None
 
@@ -243,7 +270,7 @@ def email_check_loop():
                 else:
                     try:
                         with open("debug_email_dump.txt", "a", encoding="utf-8") as df:
-                            dump = {"uid": uid, "from": msg.get("From"), "full_text": full_text}
+                            dump = {"uid": uid, "from": msg.get("From") if msg else None, "full_text": full_text}
                             df.write(json.dumps(dump) + "\n\n")
                         if VERBOSE:
                             print(f"[DEBUG] Dumped non-matching email uid {uid}")
@@ -251,6 +278,7 @@ def email_check_loop():
                         print(f"[ERROR] writing debug dump for uid {uid}: {e}")
                         traceback.print_exc()
 
+                # persist UID to avoid reposting
                 seen_set.add(uid)
                 save_seen_uids()
 
@@ -480,7 +508,7 @@ atexit.register(save_seen_uids)
 
 if __name__ == "__main__":
     print("[DEBUG] Entering main; checking token presence and starting bot")
-    print("[DEBUG] VERBOSE:", VERBOSE, "USE_READ_2H:", USE_READ_2H, "SHOW_ONLY_NEW:", SHOW_ONLY_NEW)
+    print("[DEBUG] VERBOSE:", VERBOSE, "USE_READ_2H:", USE_READ_2H, "SHOW_ONLY_NEW:", SHOW_ONLY_NEW, "MAX_PER_CYCLE:", MAX_PER_CYCLE)
     if not TOKEN:
         print("[FATAL] Missing DISCORD_TOKEN. Exiting.")
         raise SystemExit(1)
