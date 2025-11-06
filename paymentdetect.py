@@ -3,14 +3,12 @@
 paymentdetect.py
 Detect payments (Zelle, PayPal, Chime, Cash App, Venmo) and post to Discord.
 
-Features included:
-- Robust multipart/html extraction with BeautifulSoup.
-- Improved Zelle detection (bank headlines, uppercase sender names).
-- Configurable IMAP search modes:
-  * Default: UNSEEN
-  * USE_HOUR_WINDOW=true -> UNSEEN SINCE 1 hour (best-effort; SINCE may be day-granular)
-  * USE_READ_2H=true -> search SEEN or ALL then filter messages by Date header to keep only those read within last 2 hours (precise hour filtering server-side)
-- Uses BODY.PEEK[] to avoid marking messages read on fetch.
+Behavior:
+- By default, searches UNSEEN messages and posts only new UIDs (SHOW_ONLY_NEW=true).
+- To only show messages received in the past 2 hours, set USE_READ_2H=true in info.env.
+  This enforces Date-header filtering in Python to guarantee an exact 2-hour window.
+- To use a 1-hour UNSEEN SINCE fallback mode, set USE_HOUR_WINDOW=true.
+- Uses BODY.PEEK[] to avoid marking messages read.
 - Persists seen UIDs per account in seen_uids.json.
 - Dumps non-matching parsed emails to debug_email_dump.txt.
 - Optional verbose debug via VERBOSE_DEBUG env var.
@@ -40,6 +38,7 @@ load_dotenv("info.env")
 VERBOSE = os.getenv("VERBOSE_DEBUG", "false").lower() in ("1", "true", "yes")
 USE_HOUR_WINDOW = os.getenv("USE_HOUR_WINDOW", "false").lower() in ("1", "true", "yes")
 USE_READ_2H = os.getenv("USE_READ_2H", "false").lower() in ("1", "true", "yes")
+SHOW_ONLY_NEW = os.getenv("SHOW_ONLY_NEW", "true").lower() in ("1", "true", "yes")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
@@ -92,11 +91,11 @@ seen_uids = load_seen_uids()
 
 def get_search_query():
     """
-    Return an IMAP search query string based on flags.
-    Note: SINCE may be day-granular on some IMAP servers; USE_READ_2H adds extra Date-header filtering.
+    Return an IMAP search query string.
+    Note: SINCE may be day-granular on some IMAP servers; USE_READ_2H always applies exact 2-hour filtering by Date header.
     """
     if USE_READ_2H:
-        # We'll refine by Date header in Python; use SEEN SINCE to reduce returned set
+        # Narrow server-side using SEEN SINCE to reduce results; exact 2-hour filtering happens locally.
         since_date = (datetime.now() - timedelta(hours=2)).strftime("%d-%b-%Y")
         return f'(SEEN SINCE "{since_date}")'
     if USE_HOUR_WINDOW:
@@ -158,14 +157,15 @@ def check_single_email_blocking(cfg):
         for uid_b in uids:
             uid = uid_b.decode()
             seen_set = seen_uids.setdefault(addr, set())
-            if uid in seen_set:
+
+            # Skip already-seen if configured
+            if SHOW_ONLY_NEW and uid in seen_set:
                 if VERBOSE:
-                    print(f"[DEBUG] UID {uid} already processed for {addr}")
+                    print(f"[DEBUG] Skipping already-seen UID {uid} for {addr}")
                 continue
 
-            # Fetch with BODY.PEEK[] to avoid marking read
             if VERBOSE:
-                print(f"[IMAP] Fetching UID {uid} (BODY.PEEK[])")
+                print(f"[IMAP] Fetching UID {uid} (BODY.PEEK[] FLAGS)")
             try:
                 status, msg_data = mail.fetch(uid_b, "(BODY.PEEK[] FLAGS)")
             except Exception as e:
@@ -177,7 +177,7 @@ def check_single_email_blocking(cfg):
                     print(f"[DEBUG] Empty fetch for uid {uid} ({status})")
                 continue
 
-            # msg_data often contains tuples and a closing line; find the bytes payload
+            # Extract raw email bytes from fetch response
             raw_email = None
             for part in msg_data:
                 if isinstance(part, tuple) and part[1]:
@@ -196,48 +196,57 @@ def check_single_email_blocking(cfg):
                 save_seen_uids()
                 continue
 
-            # If USE_READ_2H is set, verify the Date header is within last 2 hours
+            # If USE_READ_2H: enforce exact 2-hour window by Date header
             if USE_READ_2H:
                 date_hdr = msg.get("Date")
                 if date_hdr:
                     try:
                         dt = parsedate_to_datetime(date_hdr)
-                        # normalize to UTC-aware
                         if dt.tzinfo is None:
                             dt = dt.replace(tzinfo=timezone.utc)
                         age = datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
                         if age > timedelta(hours=2):
                             if VERBOSE:
                                 print(f"[DEBUG] UID {uid} Date {dt.isoformat()} older than 2 hours; skipping")
-                            # still mark as seen in our local seen map to avoid refetching
                             seen_set.add(uid)
                             save_seen_uids()
                             continue
                     except Exception as e:
                         if VERBOSE:
                             print(f"[WARN] Failed to parse Date header for uid {uid}: {e}")
-                        # fall through and attempt detection anyway
+                        # If Date parsing fails, skip the message to be safe
+                        seen_set.add(uid)
+                        save_seen_uids()
+                        continue
                 else:
                     if VERBOSE:
-                        print(f"[WARN] No Date header for uid {uid}; proceeding without 2-hour filter")
+                        print(f"[WARN] No Date header for uid {uid}; skipping for USE_READ_2H mode")
+                    seen_set.add(uid)
+                    save_seen_uids()
+                    continue
 
             result, full_text = parse_email(msg, return_full_text=True)
 
             if result:
-                print(f"[SUCCESS] ${result['amount']} from {result['sender']} via {result['service']}")
-                if channel:
-                    embed = discord.Embed(
-                        title=f"New {result['service']} Payment!",
-                        description=f"**Account:** `{addr}`",
-                        color=0x00FF00
-                    )
-                    embed.add_field(name="Amount", value=f"${result['amount']:,.2f}", inline=True)
-                    embed.add_field(name="From", value=result['sender'], inline=True)
-                    embed.set_footer(text=f"Subject: {result['subject'][:100]}")
-                    try:
-                        asyncio.run_coroutine_threadsafe(channel.send(embed=embed), bot.loop)
-                    except Exception as e:
-                        print(f"[ERROR] sending to discord channel {cfg.get('channel_id')}: {e}")
+                # final guard: post only if SHOW_ONLY_NEW logic allows it
+                if SHOW_ONLY_NEW and uid in seen_set:
+                    if VERBOSE:
+                        print(f"[DEBUG] UID {uid} added during processing; skipping post")
+                else:
+                    print(f"[SUCCESS] ${result['amount']} from {result['sender']} via {result['service']}")
+                    if channel:
+                        embed = discord.Embed(
+                            title=f"New {result['service']} Payment!",
+                            description=f"**Account:** `{addr}`",
+                            color=0x00FF00
+                        )
+                        embed.add_field(name="Amount", value=f"${result['amount']:,.2f}", inline=True)
+                        embed.add_field(name="From", value=result['sender'], inline=True)
+                        embed.set_footer(text=f"Subject: {result['subject'][:100]}")
+                        try:
+                            asyncio.run_coroutine_threadsafe(channel.send(embed=embed), bot.loop)
+                        except Exception as e:
+                            print(f"[ERROR] sending to discord channel {cfg.get('channel_id')}: {e}")
             else:
                 # dump non-matching full_text for inspection
                 try:
@@ -249,7 +258,7 @@ def check_single_email_blocking(cfg):
                 except Exception as e:
                     print(f"[ERROR] writing debug dump for uid {uid}: {e}")
 
-            # mark seen and persist
+            # persist UID so we don't re-post later
             seen_set.add(uid)
             save_seen_uids()
 
@@ -374,7 +383,6 @@ def extract_amount_and_sender(text, service):
         if not match:
             continue
 
-        # If two groups captured (name + amount)
         if service in ("Zelle", "PayPal") and len(match.groups()) >= 2:
             sender_candidate = match.group(1).strip()
             amount_candidate = match.group(2)
