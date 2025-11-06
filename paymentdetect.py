@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
 paymentdetect.py
-Fixed: strong startup logging, explicit token checks, detailed exception traces,
-INTERNALDATE 2-hour enforcement, SHOW_ONLY_NEW behavior, and safer fetch/parse flow.
-Drop this over your current file, restart with `python paymentdetect.py`, and watch console output.
+Full script with:
+- verbose startup logs
+- reliable INTERNALDATE 2-hour filter (USE_READ_2H)
+- SHOW_ONLY_NEW enforcement
+- robust fetch using BODY.PEEK[] INTERNALDATE
+- explicit on_ready diagnostics and guaranteed email polling thread start
+- helpful debug flags via info.env:
+  VERBOSE_DEBUG, USE_HOUR_WINDOW, USE_READ_2H, SHOW_ONLY_NEW
+Environment: info.env loaded by python-dotenv with DISCORD_TOKEN and EMAIL_1_ADDRESS/_PASSWORD/_IMAP/_CHANNEL.
 """
 import os
 import re
@@ -425,15 +431,33 @@ def extract_sender_info(text):
 
 @bot.event
 async def on_ready():
-    print(f"[DEBUG] Logged in as: {bot.user} (id: {getattr(bot.user,'id',None)})")
-    print("[DEBUG] Starting email polling thread...")
-    thread = threading.Thread(target=email_check_loop, daemon=True)
-    thread.start()
+    print(f"[READY] Logged in as: {bot.user} (id: {getattr(bot.user,'id',None)})")
+    guilds = [f"{g.name}(id:{g.id})" for g in bot.guilds]
+    print("[READY] Guilds:", guilds)
+    print("[READY] Email configs loaded:", email_configs)
+    for cfg in email_configs:
+        print(f"[READY] Config for {cfg['address']}: channel_id={cfg.get('channel_id')} imap={cfg.get('imap')}")
+    # Start polling thread once
+    def start_thread():
+        try:
+            thread = threading.Thread(target=email_check_loop, daemon=True)
+            thread.start()
+            print("[READY] Email polling thread started (daemon=True)")
+        except Exception as e:
+            print("[ERROR] Failed to start email polling thread:", type(e).__name__, e)
+            traceback.print_exc()
+    if not getattr(bot, "_email_thread_started", False):
+        start_thread()
+        bot._email_thread_started = True
+    # Optional immediate synchronous check for debugging (commented out by default)
+    # print("[DEBUG] Running immediate first email check (debug-only)")
+    # email_check_loop()
 
 atexit.register(save_seen_uids)
 
 if __name__ == "__main__":
     print("[DEBUG] Entering main; checking token presence and starting bot")
+    print("[DEBUG] VERBOSE:", VERBOSE, "USE_READ_2H:", USE_READ_2H, "SHOW_ONLY_NEW:", SHOW_ONLY_NEW)
     if not TOKEN:
         print("[FATAL] Missing DISCORD_TOKEN. Exiting.")
         raise SystemExit(1)
